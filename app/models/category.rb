@@ -262,6 +262,30 @@ class Category < ActiveRecord::Base
     end
   end
 
+  def self.with_ancestor_ids
+    categories =
+      select("categories.id", "ARRAY[]::integer[] AS ancestors", "categories.id AS ancestor_id")
+
+    (SiteSetting.max_category_nesting - 1).times do
+      categories =
+        Category.from("(#{categories.to_sql}) AS categories").select(
+          "categories.id",
+          "categories.ancestor_id || categories.ancestors AS ancestors",
+          "(SELECT c.parent_category_id FROM categories c WHERE c.id = categories.ancestor_id) AS ancestor_id",
+        )
+    end
+
+    categories =
+      Category.from("(#{categories.to_sql}) AS categories").select(
+        "categories.id",
+        "(SELECT array_agg(value) FROM unnest(categories.ancestor_id || categories.ancestors) AS value WHERE value IS NOT NULL) AS ancestors",
+      )
+
+    Category.joins(
+      "INNER JOIN (#{categories.to_sql}) AS category_ancestors ON categories.id = category_ancestors.id",
+    ).select("categories.*", "category_ancestors.ancestors")
+  end
+
   def self.ancestors_of(category_ids)
     ancestor_ids = []
 
