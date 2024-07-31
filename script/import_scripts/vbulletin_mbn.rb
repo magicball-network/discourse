@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 
-require 'mysql2'
+require "mysql2"
 require File.expand_path(File.dirname(__FILE__) + "/base.rb")
-require 'htmlentities'
+require "htmlentities"
 begin
-  require 'php_serialize' # https://github.com/jqr/php-serialize
+  require "php_serialize" # https://github.com/jqr/php-serialize
 rescue LoadError
   puts
-  puts 'php_serialize not found.'
-  puts 'Add to Gemfile, like this: '
+  puts "php_serialize not found."
+  puts "Add to Gemfile, like this: "
   puts
   puts "echo gem \\'php-serialize\\' >> Gemfile"
   puts "bundle install"
@@ -23,14 +23,14 @@ class ImportScripts::VBulletin < ImportScripts::Base
 
   # CHANGE THESE BEFORE RUNNING THE IMPORTER
 
-  DB_HOST ||= ENV['DB_HOST'] || "localhost"
-  DB_NAME ||= ENV['DB_NAME'] || "vbulletin"
-  DB_PW ||= ENV['DB_PW'] || ""
-  DB_USER ||= ENV['DB_USER'] || "root"
-  TIMEZONE ||= ENV['TIMEZONE'] || "America/Los_Angeles"
-  TABLE_PREFIX ||= ENV['TABLE_PREFIX'] || "vb_"
-  ATTACHMENT_DIR ||= ENV['ATTACHMENT_DIR'] || '/path/to/your/attachment/folder'
-  IMAGES_DIR ||= ENV['IMAGES_DIR'] || '/path/to/your/images/folder'
+  DB_HOST ||= ENV["DB_HOST"] || "localhost"
+  DB_NAME ||= ENV["DB_NAME"] || "vbulletin"
+  DB_PW ||= ENV["DB_PW"] || ""
+  DB_USER ||= ENV["DB_USER"] || "root"
+  TIMEZONE ||= ENV["TIMEZONE"] || "America/Los_Angeles"
+  TABLE_PREFIX ||= ENV["TABLE_PREFIX"] || "vb_"
+  ATTACHMENT_DIR ||= ENV["ATTACHMENT_DIR"] || "/path/to/your/attachment/folder"
+  IMAGES_DIR ||= ENV["IMAGES_DIR"] || "/path/to/your/images/folder"
 
   puts "#{DB_USER}:#{DB_PW}@#{DB_HOST} wants #{DB_NAME}"
 
@@ -40,21 +40,18 @@ class ImportScripts::VBulletin < ImportScripts::Base
     super
 
     @usernames = {}
+    @usergroupLeaders = {}
 
     @tz = TZInfo::Timezone.get(TIMEZONE)
 
     @htmlentities = HTMLEntities.new
 
-    @client = Mysql2::Client.new(
-      host: DB_HOST,
-      username: DB_USER,
-      password: DB_PW,
-      database: DB_NAME
-    )
-    rescue Exception => e
-      puts '=' * 50
-      puts e.message
-      puts <<EOM
+    @client =
+      Mysql2::Client.new(host: DB_HOST, username: DB_USER, password: DB_PW, database: DB_NAME)
+  rescue Exception => e
+    puts "=" * 50
+    puts e.message
+    puts <<EOM
 Cannot connect in to database.
 
 Hostname: #{DB_HOST}
@@ -74,63 +71,94 @@ export IMAGES_DIR '/path/to/your/images/folder'
 
 Exiting.
 EOM
-      exit
+    exit
   end
 
   def execute
-    SiteSetting.migratepassword_enabled = false
-    mysql_query("CREATE INDEX firstpostid_index ON #{TABLE_PREFIX}thread (firstpostid)") rescue nil
+    #SiteSetting.migratepassword_enabled = false
+    #mysql_query("CREATE INDEX firstpostid_index ON #{TABLE_PREFIX}thread (firstpostid)") rescue nil
 
     import_groups
     import_users
     create_groups_membership
-    import_categories
-    import_topics
-    import_posts
-    import_private_messages
-    import_attachments
+    setup_group_membership_requests
 
-    close_topics
-    post_process_posts
+    #import_categories
+    #import_topics
+    #import_posts
+    #import_private_messages
+    #import_attachments
 
-    create_permalink_file
-    suspend_users
+    #close_topics
+    #post_process_posts
+
+    #create_permalink_file
+    #suspend_users
   end
 
   def import_groups
     puts "", "importing groups..."
 
     groups = mysql_query <<-SQL
-        SELECT usergroupid, title
-          FROM #{TABLE_PREFIX}usergroup
+        SELECT usergroupid, title, description, genericoptions, (SELECT count(*) > 0 FROM usergroupleader l WHERE l.usergroupid = g.usergroupid) as hasleaders
+          FROM #{TABLE_PREFIX}usergroup g
+         WHERE ispublicgroup = 1
       ORDER BY usergroupid
     SQL
 
     create_groups(groups) do |group|
       {
         id: group["usergroupid"],
-        name: @htmlentities.decode(group["title"]).strip
+        name: @htmlentities.decode(group["title"]).strip,
+        full_name: group["title"],
+        bio_raw: group["description"],
+        public_admission: group["hasleaders"].to_i == 0,
+        public_exit: true,
+        members_visibility_level: group["genericoptions"].to_i & 4 == 0 ? 4 : 0,
       }
     end
   end
 
-  def get_username_for_old_username(old_username)
-    if @usernames.has_key?(old_username)
-      @usernames[old_username]
-    else
-      old_username
+  def setup_group_membership_requests
+    puts "", "Setting group membership requests..."
+    groups = mysql_query <<-SQL
+      SELECT distinct usergroupid
+        FROM usergroupleader
+    SQL
+    groups.each do |gid|
+      group_id = group_id_from_imported_group_id(gid["usergroupid"])
+      next if !group_id
+      group = Group.find(group_id)
+      next if !group
+      puts "#{group.name} requires membership requests"
+      group.allow_membership_requests = true
+      group.save()
     end
+  end
+
+  def get_username_for_old_username(old_username)
+    @usernames.has_key?(old_username) ? @usernames[old_username] : old_username
   end
 
   def import_users
     puts "", "importing users"
+
+    leaders = mysql_query <<-SQL
+      SELECT usergroupid, userid
+        FROM usergroupleader
+    SQL
+    usergroupLeaders =
+      leaders
+        .map { |gl| [gl["usergroupid"], gl["userid"]] }
+        .group_by { |gl| gl.shift }
+        .transform_values { |values| values.flatten }
 
     user_count = mysql_query("SELECT COUNT(userid) count FROM #{TABLE_PREFIX}user").first["count"]
 
     last_user_id = -1
 
     batches(BATCH_SIZE) do |offset|
-      users = mysql_query(<<-SQL
+      users = mysql_query(<<-SQL).to_a
           SELECT userid
                , username
                , homepage
@@ -148,7 +176,6 @@ EOM
         ORDER BY userid
            LIMIT #{BATCH_SIZE}
       SQL
-      ).to_a
 
       break if users.empty?
 
@@ -157,16 +184,23 @@ EOM
 
       create_users(users, total: user_count, offset: offset) do |user|
         email = user["email"].presence || fake_email
-        email = fake_email unless email[EmailValidator.email_regex]
+        email = fake_email if !EmailAddressValidator.valid_value?(email)
 
-        password = [user["password"].presence, user["salt"].presence].compact.join(":").delete("\000")
+        password = [user["password"].presence, user["salt"].presence].compact
+          .join(":")
+          .delete("\000")
 
         username = @htmlentities.decode(user["username"]).strip
-        group_ids = user["membergroupids"].split(',').map(&:to_i)
-        ip_addr = IPAddr.new(user["ipaddress"]) rescue nil
+        group_ids = user["membergroupids"].split(",").map(&:to_i)
+        ip_addr =
+          begin
+            IPAddr.new(user["ipaddress"])
+          rescue StandardError
+            nil
+          end
 
-        cfields = {};
-        cfields['import_pass'] = password
+        cfields = {}
+        cfields["import_pass"] = password
 
         {
           id: user["userid"],
@@ -183,28 +217,47 @@ EOM
           registration_ip_address: ip_addr,
           date_of_birth: parse_birthday(user["birthday"]),
           custom_fields: cfields,
-          post_create_action: proc do |u|
-            import_profile_picture(user, u)
-            import_profile_background(user, u)
-            GroupUser.transaction do
-              group_ids.each do |gid|
-                (group_id = group_id_from_imported_group_id(gid)) &&
-                  GroupUser.find_or_create_by(user: u, group_id: group_id)
+          post_create_action:
+            proc do |u|
+              import_profile_picture(user, u)
+              import_profile_background(user, u)
+              GroupUser.transaction do
+                group_ids.each do |gid|
+                  (group_id = group_id_from_imported_group_id(gid)) &&
+                    GroupUser.find_or_create_by(user: u, group_id: group_id) do |groupUser|
+                      groupUser.owner =
+                        usergroupLeaders.include?(gid) &&
+                          usergroupLeaders[gid].include?(user["userid"].to_i)
+                    end
+                end
               end
-            end
-          end
+            end,
         }
       end
     end
 
-    @usernames = UserCustomField.joins(:user).where(name: 'import_username').pluck('user_custom_fields.value', 'users.username').to_h
+    @usernames =
+      UserCustomField
+        .joins(:user)
+        .where(name: "import_username")
+        .pluck("user_custom_fields.value", "users.username")
+        .to_h
   end
 
   def parse_birthday(birthday)
     return if birthday.blank?
-    date_of_birth = Date.strptime(birthday.gsub(/[^\d-]+/, ""), "%m-%d-%Y") rescue nil
+    date_of_birth =
+      begin
+        Date.strptime(birthday.gsub(/[^\d-]+/, ""), "%m-%d-%Y")
+      rescue StandardError
+        nil
+      end
     return if date_of_birth.nil?
-    date_of_birth.year < 1904 ? Date.new(1904, date_of_birth.month, date_of_birth.day) : date_of_birth
+    if date_of_birth.year < 1904
+      Date.new(1904, date_of_birth.month, date_of_birth.day)
+    else
+      date_of_birth
+    end
   end
 
   def create_groups_membership
@@ -217,7 +270,10 @@ EOM
         next if GroupUser.where(group_id: group.id).count > 0
         user_ids_in_group = User.where(primary_group_id: group.id).pluck(:id).to_a
         next if user_ids_in_group.size == 0
-        values = user_ids_in_group.map { |user_id| "(#{group.id}, #{user_id}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" }.join(",")
+        values =
+          user_ids_in_group
+            .map { |user_id| "(#{group.id}, #{user_id}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" }
+            .join(",")
 
         DB.exec <<~SQL
           INSERT INTO group_users (group_id, user_id, created_at, updated_at) VALUES #{values}
@@ -259,7 +315,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     else
       filename = File.join(IMAGES_DIR, picture["avatarpath"])
       return unless File.exist?(filename)
-      file = File.open(filename, 'rb')
+      file = File.open(filename, "rb")
       filename = File.basename(filename)
     end
 
@@ -271,9 +327,17 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     imported_user.user_avatar.update(custom_upload_id: upload.id)
     imported_user.update(uploaded_avatar_id: upload.id)
   ensure
-    file.close rescue nil
-    if customavatar 
-      file.unlind rescue nil
+    begin
+      file.close
+    rescue StandardError
+      nil
+    end
+    if customavatar
+      begin
+        file.unlind
+      rescue StandardError
+        nil
+      end
     end
   end
 
@@ -301,14 +365,25 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     imported_user.user_profile.upload_profile_background(upload)
   ensure
-    file.close rescue nil
-    file.unlink rescue nil
+    begin
+      file.close
+    rescue StandardError
+      nil
+    end
+    begin
+      file.unlink
+    rescue StandardError
+      nil
+    end
   end
 
   def import_categories
     puts "", "importing top level categories..."
 
-    categories = mysql_query("SELECT forumid, title, description, displayorder, parentid FROM #{TABLE_PREFIX}forum ORDER BY forumid").to_a
+    categories =
+      mysql_query(
+        "SELECT forumid, title, description, displayorder, parentid FROM #{TABLE_PREFIX}forum ORDER BY forumid",
+      ).to_a
 
     top_level_categories = categories.select { |c| c["parentid"] == -1 }
 
@@ -317,7 +392,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         id: category["forumid"],
         name: @htmlentities.decode(category["title"]).strip,
         position: category["displayorder"],
-        description: @htmlentities.decode(category["description"]).strip
+        description: @htmlentities.decode(category["description"]).strip,
       }
     end
 
@@ -339,7 +414,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         name: @htmlentities.decode(category["title"]).strip,
         position: category["displayorder"],
         description: @htmlentities.decode(category["description"]).strip,
-        parent_category_id: category_id_from_imported_category_id(category["parentid"])
+        parent_category_id: category_id_from_imported_category_id(category["parentid"]),
       }
     end
   end
@@ -347,12 +422,13 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   def import_topics
     puts "", "importing topics..."
 
-    topic_count = mysql_query("SELECT COUNT(threadid) count FROM #{TABLE_PREFIX}thread").first["count"]
+    topic_count =
+      mysql_query("SELECT COUNT(threadid) count FROM #{TABLE_PREFIX}thread").first["count"]
 
     last_topic_id = -1
 
     batches(BATCH_SIZE) do |offset|
-      topics = mysql_query(<<-SQL
+      topics = mysql_query(<<-SQL).to_a
           SELECT t.threadid threadid, t.title title, forumid, open, postuserid, t.dateline dateline, views, t.visible visible, sticky,
                  p.pagetext raw
             FROM #{TABLE_PREFIX}thread t
@@ -361,7 +437,6 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         ORDER BY t.threadid
            LIMIT #{BATCH_SIZE}
       SQL
-      ).to_a
 
       break if topics.empty?
 
@@ -369,7 +444,12 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       topics.reject! { |t| @lookup.post_already_imported?("thread-#{t["threadid"]}") }
 
       create_posts(topics, total: topic_count, offset: offset) do |topic|
-        raw = preprocess_post_raw(topic["raw"]) rescue nil
+        raw =
+          begin
+            preprocess_post_raw(topic["raw"])
+          rescue StandardError
+            nil
+          end
         next if raw.blank?
         topic_id = "thread-#{topic["threadid"]}"
         t = {
@@ -394,28 +474,28 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         topic = topic_lookup_from_imported_post_id(topic_id)
         if topic.present?
           url_slug = "thread/#{thread["threadid"]}" if thread["title"].present?
-          Permalink.create(url: url_slug, topic_id: topic[:topic_id].to_i) if url_slug.present? && topic[:topic_id].present?
+          if url_slug.present? && topic[:topic_id].present?
+            Permalink.create(url: url_slug, topic_id: topic[:topic_id].to_i)
+          end
         end
       end
-
     end
   end
 
   def import_posts
     puts "", "importing posts..."
 
-    post_count = mysql_query(<<-SQL
+    post_count = mysql_query(<<-SQL).first["count"]
       SELECT COUNT(postid) count
         FROM #{TABLE_PREFIX}post p
         JOIN #{TABLE_PREFIX}thread t ON t.threadid = p.threadid
        WHERE t.firstpostid <> p.postid
     SQL
-    ).first["count"]
 
     last_post_id = -1
 
     batches(BATCH_SIZE) do |offset|
-      posts = mysql_query(<<-SQL
+      posts = mysql_query(<<-SQL).to_a
           SELECT p.postid, p.userid, p.threadid, p.pagetext raw, p.dateline, p.visible, p.parentid
             FROM #{TABLE_PREFIX}post p
             JOIN #{TABLE_PREFIX}thread t ON t.threadid = p.threadid
@@ -424,7 +504,6 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         ORDER BY p.postid
            LIMIT #{BATCH_SIZE}
       SQL
-      ).to_a
 
       break if posts.empty?
 
@@ -432,9 +511,16 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       posts.reject! { |p| @lookup.post_already_imported?(p["postid"].to_i) }
 
       create_posts(posts, total: post_count, offset: offset) do |post|
-        raw = preprocess_post_raw(post["raw"]) rescue nil
+        raw =
+          begin
+            preprocess_post_raw(post["raw"])
+          rescue StandardError
+            nil
+          end
         next if raw.blank?
-        next unless topic = topic_lookup_from_imported_post_id("thread-#{post["threadid"]}")
+        unless topic = topic_lookup_from_imported_post_id("thread-#{post["threadid"]}")
+          next
+        end
         p = {
           id: post["postid"],
           user_id: user_id_from_imported_user_id(post["userid"]) || Discourse::SYSTEM_USER_ID,
@@ -453,32 +539,32 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
   # find the uploaded file information from the db
   def find_upload(post, attachment_id)
-    sql = "SELECT a.attachmentid attachment_id, a.userid user_id, a.attachmentid file_id, a.filename filename,
+    sql =
+      "SELECT a.attachmentid attachment_id, a.userid user_id, a.attachmentid file_id, a.filename filename,
                   LENGTH(a.filedata) AS dbsize, filedata
              FROM #{TABLE_PREFIX}attachment a
             WHERE a.attachmentid = #{attachment_id}"
     results = mysql_query(sql)
 
     unless row = results.first
-      puts "Couldn't find attachment record for post.id = #{post.id}, import_id = #{post.custom_fields['import_id']}"
+      puts "Couldn't find attachment record for post.id = #{post.id}, import_id = #{post.custom_fields["import_id"]}"
       return
     end
 
-    filename = File.join(ATTACHMENT_DIR, row['user_id'].to_s.split('').join('/'), "#{row['file_id']}.attach")
-    real_filename = row['filename']
-    real_filename.prepend SecureRandom.hex if real_filename[0] == '.'
+    filename =
+      File.join(ATTACHMENT_DIR, row["user_id"].to_s.split("").join("/"), "#{row["file_id"]}.attach")
+    real_filename = row["filename"]
+    real_filename.prepend SecureRandom.hex if real_filename[0] == "."
 
     unless File.exist?(filename)
-      if row['dbsize'].to_i == 0
-        puts "Attachment file #{row['filedataid']} doesn't exist"
+      if row["dbsize"].to_i == 0
+        puts "Attachment file #{row["filedataid"]} doesn't exist"
         return nil
       end
 
-      tmpfile = 'attach_' + row['filedataid'].to_s
-      filename = File.join('/tmp/', tmpfile)
-      File.open(filename, 'wb') { |f|
-        f.write(row['filedata'])
-      }
+      tmpfile = "attach_" + row["filedataid"].to_s
+      filename = File.join("/tmp/", tmpfile)
+      File.open(filename, "wb") { |f| f.write(row["filedata"]) }
     end
 
     upload = create_upload(post.user.id, filename, real_filename)
@@ -499,24 +585,24 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   def import_private_messages
     puts "", "importing private messages..."
 
-    topic_count = mysql_query("SELECT COUNT(pmtextid) count FROM #{TABLE_PREFIX}pmtext").first["count"]
+    topic_count =
+      mysql_query("SELECT COUNT(pmtextid) count FROM #{TABLE_PREFIX}pmtext").first["count"]
 
     last_private_message_id = -1
 
     batches(BATCH_SIZE) do |offset|
-      private_messages = mysql_query(<<-SQL
+      private_messages = mysql_query(<<-SQL).to_a
           SELECT pmtextid, fromuserid, title, message, touserarray, dateline
             FROM #{TABLE_PREFIX}pmtext
            WHERE pmtextid > #{last_private_message_id}
         ORDER BY pmtextid
            LIMIT #{BATCH_SIZE}
       SQL
-      ).to_a
 
       break if private_messages.empty?
 
       last_private_message_id = private_messages[-1]["pmtextid"]
-      private_messages.reject! { |pm| @lookup.post_already_imported?("pm-#{pm['pmtextid']}") }
+      private_messages.reject! { |pm| @lookup.post_already_imported?("pm-#{pm["pmtextid"]}") }
 
       title_username_of_pm_first_post = {}
 
@@ -524,11 +610,16 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         skip = false
         mapped = {}
 
-        mapped[:id] = "pm-#{m['pmtextid']}"
-        mapped[:user_id] = user_id_from_imported_user_id(m['fromuserid']) || Discourse::SYSTEM_USER_ID
-        mapped[:raw] = preprocess_post_raw(m['message']) rescue nil
-        mapped[:created_at] = Time.zone.at(m['dateline'])
-        title = @htmlentities.decode(m['title']).strip[0...255]
+        mapped[:id] = "pm-#{m["pmtextid"]}"
+        mapped[:user_id] = user_id_from_imported_user_id(m["fromuserid"]) ||
+          Discourse::SYSTEM_USER_ID
+        mapped[:raw] = begin
+          preprocess_post_raw(m["message"])
+        rescue StandardError
+          nil
+        end
+        mapped[:created_at] = Time.zone.at(m["dateline"])
+        title = @htmlentities.decode(m["title"]).strip[0...255]
         topic_id = nil
 
         next if mapped[:raw].blank?
@@ -537,9 +628,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         target_usernames = []
         target_userids = []
         begin
-          to_user_array = PHP.unserialize(m['touserarray'])
-        rescue
-          puts "#{m['pmtextid']} -- #{m['touserarray']}"
+          to_user_array = PHP.unserialize(m["touserarray"])
+        rescue StandardError
+          puts "#{m["pmtextid"]} -- #{m["touserarray"]}"
           skip = true
         end
 
@@ -559,8 +650,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
               target_usernames << username if username
             end
           end
-        rescue
-          puts "skipping pm-#{m['pmtextid']} `to_user_array` is not properly serialized -- #{to_user_array.inspect}"
+        rescue StandardError
+          puts "skipping pm-#{m["pmtextid"]} `to_user_array` is not properly serialized -- #{to_user_array.inspect}"
           skip = true
         end
 
@@ -568,18 +659,18 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         participants << mapped[:user_id]
         begin
           participants.sort!
-        rescue
+        rescue StandardError
           puts "one of the participant's id is nil -- #{participants.inspect}"
         end
 
         if title =~ /^Re:/
-
-          parent_id = title_username_of_pm_first_post[[title[3..-1], participants]] ||
-                      title_username_of_pm_first_post[[title[4..-1], participants]] ||
-                      title_username_of_pm_first_post[[title[5..-1], participants]] ||
-                      title_username_of_pm_first_post[[title[6..-1], participants]] ||
-                      title_username_of_pm_first_post[[title[7..-1], participants]] ||
-                      title_username_of_pm_first_post[[title[8..-1], participants]]
+          parent_id =
+            title_username_of_pm_first_post[[title[3..-1], participants]] ||
+              title_username_of_pm_first_post[[title[4..-1], participants]] ||
+              title_username_of_pm_first_post[[title[5..-1], participants]] ||
+              title_username_of_pm_first_post[[title[6..-1], participants]] ||
+              title_username_of_pm_first_post[[title[7..-1], participants]] ||
+              title_username_of_pm_first_post[[title[8..-1], participants]]
 
           if parent_id
             if t = topic_lookup_from_imported_post_id("pm-#{parent_id}")
@@ -587,21 +678,21 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
             end
           end
         else
-          title_username_of_pm_first_post[[title, participants]] ||= m['pmtextid']
+          title_username_of_pm_first_post[[title, participants]] ||= m["pmtextid"]
         end
 
-        unless topic_id
+        if topic_id
+          mapped[:topic_id] = topic_id
+        else
           mapped[:title] = title
           mapped[:archetype] = Archetype.private_message
-          mapped[:target_usernames] = target_usernames.join(',')
+          mapped[:target_usernames] = target_usernames.join(",")
 
           if mapped[:target_usernames].size < 1 # pm with yourself?
             # skip = true
             mapped[:target_usernames] = "system"
-            puts "pm-#{m['pmtextid']} has no target (#{m['touserarray']})"
+            puts "pm-#{m["pmtextid"]} has no target (#{m["touserarray"]})"
           end
-        else
-          mapped[:topic_id] = topic_id
         end
 
         skip ? nil : mapped
@@ -610,42 +701,43 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def import_attachments
-    puts '', 'importing attachments...'
+    puts "", "importing attachments..."
 
     mapping = {}
-    attachments = mysql_query(<<-SQL
+    attachments = mysql_query(<<-SQL)
       SELECT a.attachmentid, a.postid as postid, p.threadid
         FROM #{TABLE_PREFIX}attachment a, #{TABLE_PREFIX}post p
        WHERE a.postid = p.postid
        AND a.visible = 1
     SQL
-    )
     attachments.each do |attachment|
-      post_id = post_id_from_imported_post_id(attachment['postid'])
-      post_id = post_id_from_imported_post_id("thread-#{attachment['threadid']}") unless post_id
+      post_id = post_id_from_imported_post_id(attachment["postid"])
+      post_id = post_id_from_imported_post_id("thread-#{attachment["threadid"]}") unless post_id
       if post_id.nil?
-        puts "Post for attachment #{attachment['attachmentid']} not found"
+        puts "Post for attachment #{attachment["attachmentid"]} not found"
         next
       end
       mapping[post_id] ||= []
-      mapping[post_id] << attachment['attachmentid'].to_i
+      mapping[post_id] << attachment["attachmentid"].to_i
     end
 
     current_count = 0
 
-    total_count = mysql_query(<<-SQL
-      SELECT COUNT(postid) count
-        FROM #{TABLE_PREFIX}post p
-        JOIN #{TABLE_PREFIX}thread t ON t.threadid = p.threadid
-       WHERE t.firstpostid <> p.postid
-    SQL
-    ).first["count"]
+    #total_count = mysql_query(<<-SQL
+    #  SELECT COUNT(postid) count
+    #    FROM #{TABLE_PREFIX}post p
+    #    JOIN #{TABLE_PREFIX}thread t ON t.threadid = p.threadid
+    #   WHERE t.firstpostid <> p.postid
+    #SQL
+    #).first["count"]
+    total_count = Post.count
 
     success_count = 0
     fail_count = 0
 
-    attachment_regex = /\[attach[^\]]*\](\d+)\[\/attach\]/i
-    attachment_regex2 = /!\[\]\((https?:)?\/\/forum\.magicball\.net\/attachment\.php\?attachmentid=(\d+)(&stc=1)?(&d=\d+)?\)/i
+    attachment_regex = %r{\[attach[^\]]*\](\d+)\[/attach\]}i
+    attachment_regex2 =
+      %r{!\[\]\((https?:)?//forum\.magicball\.net/attachment\.php\?attachmentid=(\d+)(&stc=1)?(&d=\d+)?\)}i
 
     Post.find_each do |post|
       current_count += 1
@@ -656,9 +748,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         matches = attachment_regex.match(s)
         attachment_id = matches[1]
 
-        unless mapping[post.id].nil?
-          mapping[post.id].delete(attachment_id.to_i)
-        end
+        mapping[post.id].delete(attachment_id.to_i) unless mapping[post.id].nil?
 
         upload, filename = find_upload(post, attachment_id)
         unless upload
@@ -673,9 +763,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         matches = attachment_regex2.match(s)
         attachment_id = matches[2]
 
-        unless mapping[post.id].nil?
-          mapping[post.id].delete(attachment_id.to_i)
-        end
+        mapping[post.id].delete(attachment_id.to_i) unless mapping[post.id].nil?
 
         upload, filename = find_upload(post, attachment_id)
         unless upload
@@ -689,13 +777,12 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       # make resumed imports faster
       if new_raw == post.raw
         unless mapping[post.id].nil? || mapping[post.id].empty?
-          imported_text = mysql_query(<<-SQL
+          imported_text = mysql_query(<<-SQL).first["pagetext"]
             SELECT p.pagetext
               FROM #{TABLE_PREFIX}attachment a, #{TABLE_PREFIX}post p
              WHERE a.postid = p.postid
              AND a.attachmentid = #{mapping[post.id][0]}
           SQL
-          ).first["pagetext"]
 
           imported_text.scan(attachment_regex) do |match|
             attachment_id = match[0]
@@ -714,14 +801,18 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
           # internal upload deduplication will make sure that we do not import attachments again
           html = html_for_upload(upload, filename)
-          if !new_raw[html]
-            new_raw += "\n\n#{html}\n\n"
-          end
+          new_raw += "\n\n#{html}\n\n" if !new_raw[html]
         end
       end
 
       if new_raw != post.raw
-        PostRevisor.new(post).revise!(post.user, { raw: new_raw }, bypass_bump: true, edit_reason: 'Import attachments from vBulletin', skip_revision: true)
+        PostRevisor.new(post).revise!(
+          post.user,
+          { raw: new_raw },
+          bypass_bump: true,
+          edit_reason: "Import attachments from vBulletin",
+          skip_revision: true,
+        )
       end
 
       success_count += 1
@@ -796,22 +887,22 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     # [HTML]...[/HTML]
     raw.gsub!(/\[html\]/i, "\n```html\n")
-    raw.gsub!(/\[\/html\]/i, "\n```\n")
+    raw.gsub!(%r{\[/html\]}i, "\n```\n")
 
     # [PHP]...[/PHP]
     raw.gsub!(/\[php\]/i, "\n```php\n")
-    raw.gsub!(/\[\/php\]/i, "\n```\n")
+    raw.gsub!(%r{\[/php\]}i, "\n```\n")
 
     # [HIGHLIGHT="..."]
     raw.gsub!(/\[highlight="?(\w+)"?\]/i) { "\n```#{$1.downcase}\n" }
 
     # [CODE]...[/CODE]
     # [HIGHLIGHT]...[/HIGHLIGHT]
-    raw.gsub!(/\[\/?code\]/i, "\n```\n")
-    raw.gsub!(/\[\/?highlight\]/i, "\n```\n")
+    raw.gsub!(%r{\[/?code\]}i, "\n```\n")
+    raw.gsub!(%r{\[/?highlight\]}i, "\n```\n")
 
     # [SAMP]...[/SAMP]
-    raw.gsub!(/\[\/?samp\]/i, "`")
+    raw.gsub!(%r{\[/?samp\]}i, "`")
 
     # replace all chevrons with HTML entities
     # NOTE: must be done
@@ -826,57 +917,58 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw.gsub!("\u2603", ">")
 
     # [URL=...]...[/URL]
-    raw.gsub!(/\[url="?([^"]+?)"?\](.*?)\[\/url\]/im) { "[#{$2.strip}](#{$1})" }
-    raw.gsub!(/\[url="?(.+?)"?\](.+)\[\/url\]/im) { "[#{$2.strip}](#{$1})" }
+    raw.gsub!(%r{\[url="?([^"]+?)"?\](.*?)\[/url\]}im) { "[#{$2.strip}](#{$1})" }
+    raw.gsub!(%r{\[url="?(.+?)"?\](.+)\[/url\]}im) { "[#{$2.strip}](#{$1})" }
 
     # [URL]...[/URL]
     # [MP3]...[/MP3]
-    raw.gsub!(/\[\/?url\]/i, "")
-    raw.gsub!(/\[\/?mp3\]/i, "")
+    raw.gsub!(%r{\[/?url\]}i, "")
+    raw.gsub!(%r{\[/?mp3\]}i, "")
 
     # [MENTION]<username>[/MENTION]
-    raw.gsub!(/\[mention\](.+?)\[\/mention\]/i) do
+    raw.gsub!(%r{\[mention\](.+?)\[/mention\]}i) do
       new_username = get_username_for_old_username($1)
       "@#{new_username}"
     end
 
     # [FONT=blah] and [COLOR=blah]
-    raw.gsub! /\[FONT=.*?\](.*?)\[\/FONT\]/im, '\1'
-    raw.gsub! /\[COLOR=.*?\](.*?)\[\/COLOR\]/im, '\1'
-    raw.gsub! /\[COLOR=#.*?\](.*?)\[\/COLOR\]/im, '\1'
+    raw.gsub! %r{\[FONT=.*?\](.*?)\[/FONT\]}im, '\1'
+    raw.gsub! %r{\[COLOR=.*?\](.*?)\[/COLOR\]}im, '\1'
+    raw.gsub! %r{\[COLOR=#.*?\](.*?)\[/COLOR\]}im, '\1'
 
-    raw.gsub! /\[SIZE=.*?\](.*?)\[\/SIZE\]/im, '\1'
-    raw.gsub! /\[SUP\](.*?)\[\/SUP\]/im, '\1'
-    raw.gsub! /\[h=.*?\](.*?)\[\/h\]/im, '\1'
+    raw.gsub! %r{\[SIZE=.*?\](.*?)\[/SIZE\]}im, '\1'
+    raw.gsub! %r{\[SUP\](.*?)\[/SUP\]}im, '\1'
+    raw.gsub! %r{\[h=.*?\](.*?)\[/h\]}im, '\1'
 
-    raw.gsub! /\[float=.*?\](.*?)\[\/float\]/i, '\1'
-    raw.gsub!(/\[\/?float\]/i, "")
+    raw.gsub! %r{\[float=.*?\](.*?)\[/float\]}i, '\1'
+    raw.gsub!(%r{\[/?float\]}i, "")
 
     # [CENTER]...[/CENTER]
-    raw.gsub! /\[CENTER\](.*?)\[\/CENTER\]/im, '\1'
+    raw.gsub! %r{\[CENTER\](.*?)\[/CENTER\]}im, '\1'
 
     # [INDENT]...[/INDENT]
-    raw.gsub! /\[INDENT\](.*?)\[\/INDENT\]/im, '\1'
+    raw.gsub! %r{\[INDENT\](.*?)\[/INDENT\]}im, '\1'
 
     # [ame]...[/ame]
-    raw.gsub!(/\[ame="?(.*?)"?\](.*?)\[\/ame\]/i) { "\n#{$1}\n" }
-    raw.gsub!(/\[ame\](.*?)\[\/ame\]/i) { "\n#{$1}\n" }
+    raw.gsub!(%r{\[ame="?(.*?)"?\](.*?)\[/ame\]}i) { "\n#{$1}\n" }
+    raw.gsub!(%r{\[ame\](.*?)\[/ame\]}i) { "\n#{$1}\n" }
 
-    raw.gsub!(/\[\/?fp\]/i, "")
+    raw.gsub!(%r{\[/?fp\]}i, "")
 
     # Tables to MD
-    raw.gsub!(/\[TABLE.*?\](.*?)\[\/TABLE\]/im) { |t|
-      rows = $1.gsub!(/\s*\[TR\](.*?)\[\/TR\]\s*/im) { |r|
-        cols = $1.gsub! /\s*\[TD.*?\](.*?)\[\/TD\]\s*/im, '|\1'
-        "#{cols}|\n"
-      }
+    raw.gsub!(%r{\[TABLE.*?\](.*?)\[/TABLE\]}im) do |t|
+      rows =
+        $1.gsub!(%r{\s*\[TR\](.*?)\[/TR\]\s*}im) do |r|
+          cols = $1.gsub! %r{\s*\[TD.*?\](.*?)\[/TD\]\s*}im, '|\1'
+          "#{cols}|\n"
+        end
       header, rest = rows.split "\n", 2
       c = header.count "|"
       sep = "|---" * (c - 1)
       "#{header}\n#{sep}|\n#{rest}\n"
-    }
+    end
 
-    # Prevent a leading * to make a list    
+    # Prevent a leading * to make a list
     raw.gsub!(/^\*/, '\*')
     raw.gsub!(/^-/, '\-')
     raw.gsub!(/^\+/, '\+')
@@ -894,49 +986,51 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     #raw.gsub!(/\[\*\](.*?)\n/, '[li]\1[/li]')
     #raw.gsub!(/\[\*=1\]/, '')
 
-    raw.gsub!(/\[list\](.*?)\[\/list\]/im) { " \n#{$1} \n" }
+    raw.gsub!(%r{\[list\](.*?)\[/list\]}im) { " \n#{$1} \n" }
     raw.gsub!(/\[\*\]\s*(.*?)\n/) { "* #{$1}\n" }
 
     # [hr]...[/hr]
-    raw.gsub! /\[hr\](.*?)\[\/hr\]/im, "\n\n---\n\n"
+    raw.gsub! %r{\[hr\](.*?)\[/hr\]}im, "\n\n---\n\n"
 
     # [QUOTE]...[/QUOTE]
-    raw.gsub!(/\[quote\](.+?)\[\/quote\]/im) { |quote|
-      quote.gsub!(/\[quote\](.+?)\[\/quote\]/im) { "\n#{$1}\n" }
+    raw.gsub!(%r{\[quote\](.+?)\[/quote\]}im) do |quote|
+      quote.gsub!(%r{\[quote\](.+?)\[/quote\]}im) { "\n#{$1}\n" }
       quote.gsub!(/\n(.+?)/) { "\n> #{$1}" }
-    }
+    end
 
     # [QUOTE=<username>]...[/QUOTE]
-    raw.gsub!(/\[quote=([^;\]]+)\](.+?)\[\/quote\]/im) do
+    raw.gsub!(%r{\[quote=([^;\]]+)\](.+?)\[/quote\]}im) do
       old_username, quote = $1, $2
       new_username = get_username_for_old_username(old_username)
       "\n[quote=\"#{new_username}\"]\n#{quote}\n[/quote]\n"
     end
 
     # [YOUTUBE]<id>[/YOUTUBE]
-    raw.gsub!(/\[youtube\](.+?)\[\/youtube\]/i) { "\n//youtu.be/#{$1}\n" }
+    raw.gsub!(%r{\[youtube\](.+?)\[/youtube\]}i) { "\n//youtu.be/#{$1}\n" }
 
     # [VIDEO=youtube;<id>]...[/VIDEO]
-    raw.gsub!(/\[video=youtube;([^\]]+)\].*?\[\/video\]/i) { "\n//youtu.be/#{$1}\n" }
+    raw.gsub!(%r{\[video=youtube;([^\]]+)\].*?\[/video\]}i) { "\n//youtu.be/#{$1}\n" }
 
     # Fix uppercase B U and I tags
-    raw.gsub!(/(\[\/?[BUI]\])/i) { $1.downcase }
+    raw.gsub!(%r{(\[/?[BUI]\])}i) { $1.downcase }
 
     # More Additions ....
 
     # [spoiler=Some hidden stuff]SPOILER HERE!![/spoiler]
-    raw.gsub!(/\[spoiler="?(.+?)"?\](.+?)\[\/spoiler\]/im) { "\n#{$1}\n[spoiler]#{$2}[/spoiler]\n" }
+    raw.gsub!(%r{\[spoiler="?(.+?)"?\](.+?)\[/spoiler\]}im) do
+      "\n#{$1}\n[spoiler]#{$2}[/spoiler]\n"
+    end
 
     # [IMG][IMG]http://i63.tinypic.com/akga3r.jpg[/IMG][/IMG]
-    raw.gsub!(/\[IMG\]\[IMG\](.+?)\[\/IMG\]\[\/IMG\]/i) { "![](#{$1})" }
-    raw.gsub!(/\[IMG\](.+?)\[\/IMG\]/i) { "![](#{$1})" }
+    raw.gsub!(%r{\[IMG\]\[IMG\](.+?)\[/IMG\]\[/IMG\]}i) { "![](#{$1})" }
+    raw.gsub!(%r{\[IMG\](.+?)\[/IMG\]}i) { "![](#{$1})" }
 
     raw
   end
 
   def postprocess_post_raw(raw)
     # [QUOTE=<username>;<post_id>]...[/QUOTE]
-    raw.gsub!(/\[quote=([^;]+);(\d+)\](.+?)\[\/quote\]/im) do
+    raw.gsub!(%r{\[quote=([^;]+);(\d+)\](.+?)\[/quote\]}im) do
       old_username, post_id, quote = $1, $2, $3
 
       new_username = get_username_for_old_username(old_username)
@@ -948,7 +1042,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
       if topic_lookup = topic_lookup_from_imported_post_id(post_id)
         post_number = topic_lookup[:post_number]
-        topic_id    = topic_lookup[:topic_id]
+        topic_id = topic_lookup[:topic_id]
         "\n[quote=\"#{new_username},post:#{post_number},topic:#{topic_id}\"]\n#{quote}\n[/quote]\n"
       else
         "\n[quote=\"#{new_username}\"]\n#{quote}\n[/quote]\n"
@@ -956,11 +1050,11 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     end
 
     # remove attachments
-    raw.gsub!(/\[attach[^\]]*\]\d+\[\/attach\]/i, "")
+    raw.gsub!(%r{\[attach[^\]]*\]\d+\[/attach\]}i, "")
 
     # [THREAD]<thread_id>[/THREAD]
     # ==> http://my.discourse.org/t/slug/<topic_id>
-    raw.gsub!(/\[thread\](\d+)\[\/thread\]/i) do
+    raw.gsub!(%r{\[thread\](\d+)\[/thread\]}i) do
       thread_id = $1
       if topic_lookup = topic_lookup_from_imported_post_id("thread-#{thread_id}")
         topic_lookup[:url]
@@ -971,7 +1065,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     # [THREAD=<thread_id>]...[/THREAD]
     # ==> [...](http://my.discourse.org/t/slug/<topic_id>)
-    raw.gsub!(/\[thread=(\d+)\](.+?)\[\/thread\]/i) do
+    raw.gsub!(%r{\[thread=(\d+)\](.+?)\[/thread\]}i) do
       thread_id, link = $1, $2
       if topic_lookup = topic_lookup_from_imported_post_id("thread-#{thread_id}")
         url = topic_lookup[:url]
@@ -983,7 +1077,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     # [POST]<post_id>[/POST]
     # ==> http://my.discourse.org/t/slug/<topic_id>/<post_number>
-    raw.gsub!(/\[post\](\d+)\[\/post\]/i) do
+    raw.gsub!(%r{\[post\](\d+)\[/post\]}i) do
       post_id = $1
       if topic_lookup = topic_lookup_from_imported_post_id(post_id)
         topic_lookup[:url]
@@ -994,7 +1088,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     # [POST=<post_id>]...[/POST]
     # ==> [...](http://my.discourse.org/t/<topic_slug>/<topic_id>/<post_number>)
-    raw.gsub!(/\[post=(\d+)\](.+?)\[\/post\]/i) do
+    raw.gsub!(%r{\[post=(\d+)\](.+?)\[/post\]}i) do
       post_id, link = $1, $2
       if topic_lookup = topic_lookup_from_imported_post_id(post_id)
         url = topic_lookup[:url]
@@ -1008,7 +1102,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def create_permalink_file
-    puts '', 'Creating Permalink File...', ''
+    puts "", "Creating Permalink File...", ""
 
     id_mapping = []
     current_count = 0
@@ -1019,12 +1113,13 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
       pcf = topic.first_post.custom_fields
       if pcf && pcf["import_id"]
-        id = pcf["import_id"].split('-').last
+        id = pcf["import_id"].split("-").last
         #id_mapping.push("XXX#{id}  YYY#{topic.id}")
-        Permalink.create(
-          url: "/showthread.php?t=#{id}",
-          topic_id: topic.id
-        ) rescue nil
+        begin
+          Permalink.create(url: "/showthread.php?t=#{id}", topic_id: topic.id)
+        rescue StandardError
+          nil
+        end
       end
     end
 
@@ -1033,10 +1128,11 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       if ccf && ccf["import_id"]
         id = ccf["import_id"].to_i
         #id_mapping.push("/forumdisplay.php?#{id}  http://forum.quartertothree.com#{cat.url}")
-        Permalink.create(
-          url: "/forumdisplay.php?f=#{id}",
-          category_id: cat.id
-        ) rescue nil
+        begin
+          Permalink.create(url: "/forumdisplay.php?f=#{id}", category_id: cat.id)
+        rescue StandardError
+          nil
+        end
       end
     end
 
@@ -1045,20 +1141,19 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     #    csv << [value]
     #  end
     #end
-
   end
 
   def suspend_users
-    puts '', "updating banned users"
+    puts "", "updating banned users"
 
     banned = 0
     failed = 0
-    total = mysql_query("SELECT count(*) count FROM #{TABLE_PREFIX}userban").first['count']
+    total = mysql_query("SELECT count(*) count FROM #{TABLE_PREFIX}userban").first["count"]
 
     system_user = Discourse.system_user
 
     mysql_query("SELECT userid, bandate FROM #{TABLE_PREFIX}userban").each do |b|
-      user = User.find_by_id(user_id_from_imported_user_id(b['userid']))
+      user = User.find_by_id(user_id_from_imported_user_id(b["userid"]))
       if user
         user.suspended_at = parse_timestamp(user["bandate"])
         user.suspended_till = 200.years.from_now
@@ -1071,7 +1166,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           failed += 1
         end
       else
-        puts "Not found: #{b['userid']}"
+        puts "Not found: #{b["userid"]}"
         failed += 1
       end
 
@@ -1088,7 +1183,6 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   def mysql_query(sql)
     @client.query(sql, cache_rows: true)
   end
-
 end
 
 ImportScripts::VBulletin.new.perform
