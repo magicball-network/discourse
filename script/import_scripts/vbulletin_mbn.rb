@@ -40,7 +40,6 @@ class ImportScripts::VBulletin < ImportScripts::Base
     super
 
     @usernames = {}
-    @usergroupLeaders = {}
 
     @tz = TZInfo::Timezone.get(TIMEZONE)
 
@@ -76,6 +75,8 @@ EOM
 
   def execute
     #SiteSetting.migratepassword_enabled = false
+    SiteSetting.enable_category_group_moderation = true
+    SiteSetting.max_category_nesting = 3
     #mysql_query("CREATE INDEX firstpostid_index ON #{TABLE_PREFIX}thread (firstpostid)") rescue nil
 
     import_groups
@@ -83,7 +84,8 @@ EOM
     create_groups_membership
     setup_group_membership_requests
 
-    #import_categories
+    import_categories
+    #setup_category_moderator_groups
     #import_topics
     #import_posts
     #import_private_messages
@@ -130,7 +132,7 @@ EOM
       next if !group_id
       group = Group.find(group_id)
       next if !group
-      puts "#{group.name} requires membership requests"
+      puts "\t#{group.name}"
       group.allow_membership_requests = true
       group.save()
     end
@@ -153,7 +155,13 @@ EOM
         .group_by { |gl| gl.shift }
         .transform_values { |values| values.flatten }
 
-    user_count = mysql_query("SELECT COUNT(userid) count FROM #{TABLE_PREFIX}user").first["count"]
+    # Exclude new users without confirmed email signed up more than 90 days ago
+    user_count =
+      mysql_query(
+        "SELECT COUNT(userid) count FROM #{TABLE_PREFIX}user WHERE (usergroupid != 3 OR posts > 0 OR joindate > (unix_timestamp() - 90*259200))",
+      ).first[
+        "count"
+      ]
 
     last_user_id = -1
 
@@ -173,6 +181,7 @@ EOM
                , birthday
             FROM #{TABLE_PREFIX}user
            WHERE userid > #{last_user_id}
+             AND (usergroupid != 3 OR posts > 0 OR joindate > (unix_timestamp() - 90*259200))
         ORDER BY userid
            LIMIT #{BATCH_SIZE}
       SQL
@@ -380,10 +389,19 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   def import_categories
     puts "", "importing top level categories..."
 
-    categories =
-      mysql_query(
-        "SELECT forumid, title, description, displayorder, parentid FROM #{TABLE_PREFIX}forum ORDER BY forumid",
-      ).to_a
+    categories = mysql_query(<<-SQL).to_a
+          SELECT forumid, title, description, displayorder, parentid, parentId AS origParentId,
+                 (options & 2 > 0) AS is_allow_posting,
+                 (options & 4 = 0) AS is_category_only,
+                 (SELECT forumpermissions & 524288 > 0 FROM #{TABLE_PREFIX}forumpermission fp WHERE fp.forumid = f.forumid AND usergroupid = 1) AS public_access,
+                 (SELECT forumpermissions & 524288 > 0 FROM #{TABLE_PREFIX}forumpermission fp WHERE fp.forumid = f.forumid AND usergroupid = 2) AS registered_access,
+                 (SELECT forumpermissions & 16 > 0 FROM #{TABLE_PREFIX}forumpermission fp WHERE fp.forumid = f.forumid AND usergroupid = 2) AS registered_create,
+                 (SELECT forumpermissions & 96 > 0 FROM #{TABLE_PREFIX}forumpermission fp WHERE fp.forumid = f.forumid AND usergroupid = 2) AS registered_reply,
+                 (SELECT max(forumpermissions & 524288 > 0) FROM #{TABLE_PREFIX}forumpermission fp WHERE fp.forumid = f.forumid AND usergroupid IN (5,6)) AS staff_access,
+                 (SELECT count(DISTINCT coalesce(fp.forumpermissions & 524288 > 0, 2)) > 1 FROM #{TABLE_PREFIX}usergroup ug LEFT OUTER JOIN #{TABLE_PREFIX}forumpermission fp ON fp.forumid = f.forumid AND fp.usergroupid = ug.usergroupid WHERE ug.ispublicgroup = 1) AS special_access
+            FROM #{TABLE_PREFIX}forum f 
+        ORDER BY forumid
+      SQL
 
     top_level_categories = categories.select { |c| c["parentid"] == -1 }
 
@@ -396,15 +414,152 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       }
     end
 
-    puts "", "importing children categories..."
+    top_level_categories.each { |c| import_subcategories(c, categories, 1) }
 
-    children_categories = categories.select { |c| c["parentid"] != -1 }
-    top_level_category_ids = Set.new(top_level_categories.map { |c| c["forumid"] })
+    puts "", "Applying category permissions..."
+    top_level_categories.each { |c| process_category_permissions(c, categories) }
+  end
 
-    # cut down the tree to only 2 levels of categories
-    children_categories.each do |cc|
-      while !top_level_category_ids.include?(cc["parentid"])
-        cc["parentid"] = categories.detect { |c| c["forumid"] == cc["parentid"] }["parentid"]
+  def process_category_permissions(cat, categories)
+    access = flatten_forum_access(cat, categories)
+    apply_category_permissions(
+      Category.find(category_id_from_imported_category_id(cat["forumid"])),
+      cat,
+      access,
+    )
+
+    children_categories = categories.select { |c| c["parentid"] == cat["forumid"] }
+    children_categories.each { |c| process_category_permissions(c, categories) }
+  end
+
+  def flatten_forum_access(category, categories)
+    access = {
+      public_access: nil,
+      registered_access: nil,
+      registered_create: nil,
+      registered_reply: nil,
+      staff_access: nil,
+      special_access: 0,
+    }
+    while category
+      access.keys.each { |p| access[p] = category[p.to_s] if access[p].nil? }
+      access[:special_access] = category["special_access"] if access[:special_access] == 0
+      category = categories.detect { |c| c["forumid"] == category["origParentId"] }
+    end
+    # Assume standard access
+    access[:public_access] = 1 if access[:public_access].nil?
+    access[:registered_access] = 1 if access[:registered_access].nil?
+    access[:registered_create] = 1 if access[:registered_create].nil?
+    access[:registered_reply] = 1 if access[:registered_reply].nil?
+
+    access
+  end
+
+  def apply_category_permissions(category, forum, access)
+    if !category.subcategories.empty?
+      category.show_subcategory_list = true
+      category.subcategory_list_style = "rows_with_featured_topics"
+    end
+
+    if (forum["is_category_only"] == 1 && access[:public_access] == 1)
+      puts "\t#{category.name} is a public category only"
+      category.permissions = { everyone: :readonly }
+      category.save()
+      return
+    end
+
+    if !category.subcategories.empty? && forum["is_category_only"] == 0
+      # Also a forum, don't show content of subforum
+      category.default_list_filter = "none"
+    end
+
+    permissions = {}
+    base_level = "trust_level_0"
+    base_level = :everyone if access[:public_access] == 1
+
+    if access[:registered_access] == 1
+      if forum["is_allow_posting"] == 0 || forum["is_category_only"] == 1
+        permissions[base_level] = :readonly
+      elsif access[:registered_create] == 1
+        permissions[base_level] = :full
+      elsif access[:registered_reply] == 1
+        permissions[base_level] = :create_post
+      else
+        permissions[base_level] = :readonly
+      end
+    end
+
+    permissions["staff"] = :full if access[:staff_access] == 1
+
+    apply_special_category_permissions(category, forum, permissions) if access[:special_access] == 1
+
+    puts "\t#{category.name} permissions: #{permissions}"
+    category.permissions = permissions
+    category.save()
+  end
+
+  def apply_special_category_permissions(category, forum, permissions)
+    parent_public = true
+    parent_parent_public = true
+    if !category.parent_category.nil?
+      parent_public = !category.parent_category.category_groups.detect { |g| g.group.id == 0 }.nil?
+      if !category.parent_category.parent_category.nil?
+        parent_parent_public =
+          !category
+            .parent_category
+            .parent_category
+            .category_groups
+            .detect { |g| g.group.id == 0 }
+            .nil?
+      end
+    end
+    forumid = forum["forumid"]
+    specials = mysql_query(<<-SQL)
+        SELECT ug.usergroupid, ug.title,
+                 fp.forumpermissions & 524288 > 0 as can_see,
+                 fp.forumpermissions & 16 > 0 as can_create,
+                 fp.forumpermissions & 96 > 0 as can_reply
+          FROM forumpermission fp 
+          JOIN usergroup ug ON fp.usergroupid = ug.usergroupid AND ug.ispublicgroup = 1 
+         WHERE fp.forumid = #{forumid}
+           AND fp.forumpermissions & 524288 > 0
+      SQL
+    specials.each do |perms|
+      groupid = group_id_from_imported_group_id(perms["usergroupid"])
+      if perms["can_create"] == 1
+        permissions[groupid] = :full
+      elsif perms["can_reply"] == 1
+        permissions[groupid] = :create_post
+      else
+        permissions[groupid] = :readonly
+      end
+      # If parents are not public the group must also have readonly access to parent
+      if !parent_parent_public
+        add_minimal_access_to_category(category.parent_category.parent_category, groupid)
+      end
+      add_minimal_access_to_category(category.parent_category, groupid) if !parent_public
+    end
+  end
+
+  def add_minimal_access_to_category(category, groupid)
+    return if !category.parent_category.category_groups.detect { |g| g.group.id == groupid }.nil?
+    category.category_groups.build(group_id: groupid, permission_type: :readonly)
+    category.save()
+  end
+
+  def import_subcategories(parent, categories, depth)
+    children_categories = categories.select { |c| c["parentid"] == parent["forumid"] }
+    return if children_categories.empty?
+
+    puts "",
+         "importing #{children_categories.length} child categories for \"#{parent["title"]}\" (depth #{depth})..."
+
+    if depth >= SiteSetting.max_category_nesting
+      puts "\treducing category depth"
+      children_categories.each do |cc|
+        while cc["parentid"] != parent["forumid"]
+          cc["parentid"] = categories.detect { |c| c["forumid"] == cc["parentid"] }["parentid"]
+        end
       end
     end
 
@@ -417,6 +572,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         parent_category_id: category_id_from_imported_category_id(category["parentid"]),
       }
     end
+
+    children_categories.each { |c| import_subcategories(c, categories, depth + 1) }
   end
 
   def import_topics
