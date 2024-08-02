@@ -74,18 +74,25 @@ EOM
   end
 
   def execute
-    #SiteSetting.migratepassword_enabled = false
     SiteSetting.enable_category_group_moderation = true
     SiteSetting.max_category_nesting = 3
-    #mysql_query("CREATE INDEX firstpostid_index ON #{TABLE_PREFIX}thread (firstpostid)") rescue nil
+    begin
+      mysql_query("CREATE INDEX firstpostid_index ON #{TABLE_PREFIX}thread (firstpostid)")
+    rescue StandardError
+      nil
+    end
 
     import_groups
+    # Do not enable while creating users
+    SiteSetting.migratepassword_enabled = false
     import_users
+    SiteSetting.migratepassword_enabled = true
     create_groups_membership
     setup_group_membership_requests
 
     import_categories
-    #setup_category_moderator_groups
+    setup_category_moderator_groups
+
     #import_topics
     #import_posts
     #import_private_messages
@@ -111,7 +118,7 @@ EOM
     create_groups(groups) do |group|
       {
         id: group["usergroupid"],
-        name: @htmlentities.decode(group["title"]).strip,
+        name: @htmlentities.decode(group["title"]).strip.downcase,
         full_name: group["title"],
         bio_raw: group["description"],
         public_admission: group["hasleaders"].to_i == 0,
@@ -191,6 +198,10 @@ EOM
       last_user_id = users[-1]["userid"]
       users.reject! { |u| @lookup.user_already_imported?(u["userid"]) }
 
+      groupAdmins = Group.find(Group::AUTO_GROUPS[:admins])
+      groupStaff = Group.find(Group::AUTO_GROUPS[:staff])
+      groupMods = Group.find(Group::AUTO_GROUPS[:moderators])
+
       create_users(users, total: user_count, offset: offset) do |user|
         email = user["email"].presence || fake_email
         email = fake_email if !EmailAddressValidator.valid_value?(email)
@@ -226,11 +237,21 @@ EOM
           registration_ip_address: ip_addr,
           date_of_birth: parse_birthday(user["birthday"]),
           custom_fields: cfields,
+          admin: user["usergroupid"] == 6,
+          moderator: user["usergroupid"] == 5,
           post_create_action:
             proc do |u|
               import_profile_picture(user, u)
               import_profile_background(user, u)
               GroupUser.transaction do
+                if user["usergroupid"] == 6
+                  GroupUser.find_or_create_by(user: u, group: groupAdmins)
+                  GroupUser.find_or_create_by(user: u, group: groupStaff)
+                end
+                if user["usergroupid"] == 5
+                  GroupUser.find_or_create_by(user: u, group: groupMods)
+                  GroupUser.find_or_create_by(user: u, group: groupStaff)
+                end
                 group_ids.each do |gid|
                   (group_id = group_id_from_imported_group_id(gid)) &&
                     GroupUser.find_or_create_by(user: u, group_id: group_id) do |groupUser|
@@ -504,15 +525,10 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     parent_public = true
     parent_parent_public = true
     if !category.parent_category.nil?
-      parent_public = !category.parent_category.category_groups.detect { |g| g.group.id == 0 }.nil?
+      parent_public = category.parent_category.category_groups.any? { |g| g.group.id == 0 }
       if !category.parent_category.parent_category.nil?
         parent_parent_public =
-          !category
-            .parent_category
-            .parent_category
-            .category_groups
-            .detect { |g| g.group.id == 0 }
-            .nil?
+          category.parent_category.parent_category.category_groups.any? { |g| g.group.id == 0 }
       end
     end
     apply_defaults = permissions.empty?
@@ -562,7 +578,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def add_minimal_access_to_category(category, groupid)
-    return if !category.parent_category.category_groups.detect { |g| g.group.id == groupid }.nil?
+    return if category.parent_category.category_groups.any? { |g| g.group.id == groupid }
     category.category_groups.build(group_id: groupid, permission_type: :readonly)
     category.save()
   end
@@ -594,6 +610,72 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     end
 
     children_categories.each { |c| import_subcategories(c, categories, depth + 1) }
+  end
+
+  def setup_category_moderator_groups
+    puts "", "creating category moderator groups"
+    forums = mysql_query("SELECT forumid, parentid, title FROM #{TABLE_PREFIX}forum").to_a
+    forums.each { |f| f["children"] = forums.select { |c| c["parentid"] == f["forumid"] } }
+    forum_map = forums.map { |f| [f["forumid"], f] }.to_h
+    modentries = mysql_query(<<-SQL).to_a
+      SELECT m.forumid, m.userid, u.usergroupid IN (5,6) is_staff
+        FROM #{TABLE_PREFIX}moderator m
+        JOIN #{TABLE_PREFIX}user u ON u.userid = m.userid
+       WHERE permissions & 1 > 0
+         AND forumid > -1
+    SQL
+
+    forum_mods = {}
+    modentries.each do |mod|
+      forumid = mod["forumid"]
+      forum_mods[forumid] = [] if forum_mods[forumid].nil?
+      forum_mods[forumid] << mod
+    end
+
+    forum_mods.each do |forumid, mods|
+      forum = forum_map[forumid]
+      puts "\tcreating moderator group for #{forumid}: " + forum["title"]
+      group = {
+        id: "forummod-#{forumid}",
+        name: "mods_" + @htmlentities.decode(forum["title"]).strip.downcase,
+        full_name: "Moderators: " + forum["title"],
+        public_admission: false,
+        public_exit: true,
+      }
+      group_id = group_id_from_imported_group_id(group[:id])
+      group_id = create_group(group, group[:id]).id if !group_id
+      mods.each do |m|
+        GroupUser.find_or_create_by(
+          user_id: user_id_from_imported_user_id(m["userid"]),
+          group_id: group_id,
+        )
+      end
+      parent_forum = forum_map[forum["parentid"]]
+      while parent_forum
+        parent_id = parent_forum["forumid"]
+        parent_mods = forum_mods[parent_id]
+        if parent_mods
+          parent_mods.each do |m|
+            GroupUser.find_or_create_by(
+              user_id: user_id_from_imported_user_id(m["userid"]),
+              group_id: group_id,
+            )
+          end
+        end
+        parent_forum = forum_map[parent_forum["parentid"]]
+      end
+      apply_category_moderator_group(forum_map, forumid, Group.find(group_id))
+    end
+  end
+
+  def apply_category_moderator_group(forum_map, forum_id, group)
+    category = Category.find(category_id_from_imported_category_id(forum_id))
+    category.reviewable_by_group = group
+    category.save()
+
+    forum_map[forum_id]["children"].each do |c|
+      apply_category_moderator_group(forum_map, c["forumid"], group)
+    end
   end
 
   def import_topics
