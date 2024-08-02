@@ -403,6 +403,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         ORDER BY forumid
       SQL
 
+    categories.each { |c| c["parent"] = categories.detect { |p| p["forumid"] == c["parentid"] } }
+
     top_level_categories = categories.select { |c| c["parentid"] == -1 }
 
     create_categories(top_level_categories) do |category|
@@ -513,18 +515,36 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
             .nil?
       end
     end
-    forumid = forum["forumid"]
-    specials = mysql_query(<<-SQL)
-        SELECT ug.usergroupid, ug.title,
-                 fp.forumpermissions & 524288 > 0 as can_see,
-                 fp.forumpermissions & 16 > 0 as can_create,
-                 fp.forumpermissions & 96 > 0 as can_reply
-          FROM forumpermission fp 
-          JOIN usergroup ug ON fp.usergroupid = ug.usergroupid AND ug.ispublicgroup = 1 
-         WHERE fp.forumid = #{forumid}
-           AND fp.forumpermissions & 524288 > 0
-      SQL
-    specials.each do |perms|
+    apply_defaults = permissions.empty?
+    specials = {}
+    while !forum.nil?
+      forumid = forum["forumid"]
+      result = mysql_query(<<-SQL)
+          SELECT ug.usergroupid, ug.title,
+                   fp.forumpermissions IS NOT NULL as non_default,
+                   coalesce(fp.forumpermissions & 524288 > 0, ug.forumpermissions & 524288 > 0) as can_see,
+                   coalesce(fp.forumpermissions & 16 > 0, ug.forumpermissions & 16> 0) as can_create,
+                   coalesce(fp.forumpermissions & 96 > 0, ug.forumpermissions & 96 > 0) as can_reply
+            FROM #{TABLE_PREFIX}usergroup ug
+       LEFT JOIN #{TABLE_PREFIX}forumpermission fp ON fp.usergroupid = ug.usergroupid AND fp.forumid = #{forumid}
+           WHERE ug.ispublicgroup = 1
+             AND (fp.forumpermissions & 524288 > 0
+              OR ug.forumpermissions & 524288 > 0)
+        SQL
+      forum = forum["parent"]
+      result.each do |perms|
+        groupid = perms["usergroupid"]
+        if specials[groupid].nil?
+          specials[groupid] = perms
+        elsif specials[groupid]["non_default"] == 0
+          specials[groupid] = perms
+        end
+      end
+    end
+
+    specials.each_value do |perms|
+      next if perms["can_see"] == 0
+      next if !apply_defaults && perms["non_default"] == 0
       groupid = group_id_from_imported_group_id(perms["usergroupid"])
       if perms["can_create"] == 1
         permissions[groupid] = :full
