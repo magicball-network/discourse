@@ -18,7 +18,7 @@ end
 # For vBulletin 3, based on vbulletin.rb which is for vBulletin 4.
 
 class ImportScripts::VBulletin < ImportScripts::Base
-  BATCH_SIZE = 2000
+  BATCH_SIZE = 1000
 
   # CHANGE THESE BEFORE RUNNING THE IMPORTER
 
@@ -116,12 +116,12 @@ EOM
     import_topics
     import_posts
     #import_private_messages
+    import_pm_archive
     import_attachments
 
     close_topics
     post_process_posts
 
-    #create_permalink_file
     suspend_users
   end
 
@@ -136,10 +136,10 @@ EOM
       (SiteSetting.title == "Discourse" || !SiteSetting.title)
     SiteSetting.notification_email = settings["webmasteremail"] if settings["webmasteremail"] &&
       SiteSetting.notification_email == "noreply@unconfigured.discourse.org"
-    if !SiteSetting.company_name
-      if settings["companyname"]
+    if SiteSetting.company_name.nil? || SiteSetting.company_name.empty?
+      if !settings["companyname"].empty?
         SiteSetting.company_name = settings["companyname"]
-      elsif settings["hometitle"]
+      elsif !settings["hometitle"].empty?
         SiteSetting.company_name = settings["hometitle"]
       end
     end
@@ -724,7 +724,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     topic_count =
       mysql_query(
-        "SELECT COUNT(threadid) count FROM #{TABLE_PREFIX}thread WHERE visible <> 2",
+        "SELECT COUNT(threadid) count FROM #{TABLE_PREFIX}thread WHERE visible <> 2 AND firstpostid <> 0",
       ).first[
         "count"
       ]
@@ -734,7 +734,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     batches(BATCH_SIZE) do |offset|
       topics = mysql_query(<<-SQL).to_a
           SELECT t.threadid threadid, t.title title, forumid, open, postuserid, t.dateline dateline, views, t.visible visible, sticky,
-                 p.pagetext raw, t.pollid pollid
+                 p.postid, p.pagetext raw, t.pollid pollid
             FROM #{TABLE_PREFIX}thread t
             JOIN #{TABLE_PREFIX}post p ON p.postid = t.firstpostid
            WHERE t.threadid > #{last_topic_id} AND t.visible <> 2
@@ -751,10 +751,22 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         raw =
           begin
             preprocess_post_raw(topic["raw"])
-          rescue StandardError
+          rescue StandardError => e
+            puts "",
+                 "Failed preprocessing raw for thread #{topic["threadid"]}",
+                 e.message,
+                 e.backtrace
             nil
           end
-        next if raw.blank?
+
+        if raw.blank?
+          puts "", "No body for thread #{topic["threadid"]}"
+          next
+        end
+
+        poll_data, poll_raw = retrieve_poll_data(topic["pollid"])
+        raw = poll_raw << "\n\n" << raw if poll_raw
+
         topic_id = "thread-#{topic["threadid"]}"
         t = {
           id: topic_id,
@@ -765,19 +777,73 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           created_at: parse_timestamp(topic["dateline"]),
           visible: topic["visible"].to_i == 1,
           views: topic["views"],
+          post_create_action:
+            proc do |post|
+              post_process_poll(post, poll_data) if poll_data
+              Permalink.create(
+                url: "showthread.php?t=#{topic["threadid"]}",
+                topic_id: post.topic_id,
+              )
+              Permalink.create(url: "showpost.php?p=#{topic["postid"]}", topic_id: post.topic_id)
+            end,
         }
         t[:pinned_at] = t[:created_at] if topic["sticky"].to_i == 1
         t
       end
+    end
+  end
 
-      topics.each do |thread|
-        topic_id = "thread-#{thread["threadid"]}"
-        topic = topic_lookup_from_imported_post_id(topic_id)
-        if topic.present?
-          url_slug = "showthread.php?t=#{thread["threadid"]}"
-          Permalink.create(url: url_slug, topic_id: topic[:topic_id].to_i)
-        end
+  def retrieve_poll_data(pollid)
+    return nil, nil if pollid <= 0
+    poll_data = mysql_query("SELECT * FROM #{TABLE_PREFIX}poll WHERE pollid = #{pollid}").first.to_h
+    return nil, nil if !poll_data["pollid"]
+
+    options = poll_data["options"].split("|||")
+    # Ensure unique values
+    options.each_index do |x|
+      cnt = 1
+      val = options[x].strip
+      idx = options.find_index(val)
+      while !idx.nil? && idx < x
+        cnt += 1
+        val = options[x].strip << " (#{cnt})"
+        idx = options.find_index(val)
       end
+      options[x] = val
+    end
+
+    arguments = ["results=on_vote"]
+    arguments << "status=closed" if poll_data["active"] == 0
+    arguments << "type=multiple" if poll_data["multiple"] == 1
+    arguments << "public=true" if poll_data["public"] == 1
+    if poll_data["timeout"] > 0
+      arguments << "close=" + parse_timestamp(poll_data["timeout"]).iso8601
+    end
+
+    raw = poll_data["question"].dup
+    raw << "\n\n[poll #{arguments.join(" ")}]"
+    options.each { |opt| raw << "\n* #{opt}" }
+    raw << "\n[/poll]"
+
+    [poll_data, raw]
+  end
+
+  def post_process_poll(post, poll_data)
+    poll = post.polls.first
+    return if !poll
+
+    option_map = {}
+    poll.poll_options.each_with_index { |option, index| option_map[index + 1] = option.id }
+    poll_votes =
+      mysql_query(
+        "SELECT * FROM #{TABLE_PREFIX}pollvote WHERE pollid = #{poll_data["pollid"]} AND votetype = 0",
+      )
+    poll_votes.each do |vote|
+      PollVote.create!(
+        poll: poll,
+        poll_option_id: option_map[vote["voteoption"]],
+        user_id: user_id_from_imported_user_id(vote["userid"]),
+      )
     end
   end
 
@@ -797,7 +863,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     batches(BATCH_SIZE) do |offset|
       posts = mysql_query(<<-SQL).to_a
-          SELECT p.postid, p.userid, p.threadid, p.pagetext raw, p.dateline, p.visible, p.parentid
+          SELECT p.postid, p.userid, p.threadid, p.pagetext raw, p.dateline, p.visible, p.parentid, p.attach
             FROM #{TABLE_PREFIX}post p
             JOIN #{TABLE_PREFIX}thread t ON t.threadid = p.threadid
            WHERE t.firstpostid <> p.postid AND t.visible <> 2 AND p.visible <> 2
@@ -815,13 +881,26 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         raw =
           begin
             preprocess_post_raw(post["raw"])
-          rescue StandardError
+          rescue StandardError => e
+            puts "", "Failed preprocessing raw for post #{post["postid"]}", e.message, e.backtrace
             nil
           end
-        next if raw.blank?
+
+        if raw.blank?
+          if post["attach"] > 0
+            # Post with no text, but does have attachments
+            raw = "[attach]0[/attach]"
+          else
+            puts "", "No body for post #{post["postid"]}"
+            next
+          end
+        end
+
         unless topic = topic_lookup_from_imported_post_id("thread-#{post["threadid"]}")
+          puts "", "Missing thread for post #{post["postid"]}: thread-#{post["threadid"]}"
           next
         end
+
         p = {
           id: post["postid"],
           user_id: user_id_from_imported_user_id(post["userid"]) || Discourse::SYSTEM_USER_ID,
@@ -829,19 +908,15 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           raw: raw,
           created_at: parse_timestamp(post["dateline"]),
           hidden: post["visible"].to_i != 1,
+          post_create_action:
+            proc do |realpost|
+              Permalink.create(url: "showpost.php?p=#{post["postid"]}", post_id: realpost.id)
+            end,
         }
         if parent = topic_lookup_from_imported_post_id(post["parentid"])
           p[:reply_to_post_number] = parent[:post_number]
         end
         p
-      end
-
-      posts.each do |post|
-        post_id = post_id_from_imported_post_id(post["postid"])
-        if post_id
-          url_slug = "showpost.php?p=#{post["postid"]}"
-          Permalink.create(url: url_slug, post_id: post_id)
-        end
       end
     end
   end
@@ -1022,6 +1097,10 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     end
   end
 
+  def import_pm_archive
+    puts "", "importing private message archives..."
+  end
+
   def import_attachments
     puts "", "importing attachments..."
 
@@ -1064,6 +1143,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       new_raw.gsub!(attachment_regex) do |s|
         matches = attachment_regex.match(s)
         attachment_id = matches[1]
+        next "" if attachment_id.to_i == 0
 
         mapping[post.id].delete(attachment_id.to_i) unless mapping[post.id].nil?
 
@@ -1079,6 +1159,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       new_raw.gsub!(attachment_regex2) do |s|
         matches = attachment_regex2.match(s)
         attachment_id = matches[2]
+        next "" if attachment_id.to_i == 0
 
         mapping[post.id].delete(attachment_id.to_i) unless mapping[post.id].nil?
 
@@ -1180,7 +1261,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     Post.find_each do |post|
       begin
         old_raw = post.raw.dup
-        new_raw = postprocess_post_raw(post.raw)
+        new_raw = postprocess_post_raw(post, post.raw)
         if new_raw != old_raw
           post.raw = new_raw
           post.save
@@ -1195,6 +1276,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
   def preprocess_post_raw(raw)
     return "" if raw.blank?
+
+    raw = raw.encode("UTF-8", "UTF-8", invalid: :replace)
 
     # decode HTML entities
     raw = @htmlentities.decode(raw)
@@ -1211,13 +1294,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw.gsub!(/\[php\]/i, "\n```php\n")
     raw.gsub!(%r{\[/php\]}i, "\n```\n")
 
-    # [HIGHLIGHT="..."]
-    raw.gsub!(/\[highlight="?(\w+)"?\]/i) { "\n```#{$1.downcase}\n" }
-
     # [CODE]...[/CODE]
     # [HIGHLIGHT]...[/HIGHLIGHT]
     raw.gsub!(%r{\[/?code\]}i, "\n```\n")
-    raw.gsub!(%r{\[/?highlight\]}i, "\n```\n")
 
     # [SAMP]...[/SAMP]
     raw.gsub!(%r{\[/?samp\]}i, "`")
@@ -1238,24 +1317,26 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw.gsub!(
       %r{\[url\](https?:)?//#{Regexp.escape(FORUM_URL)}show(thread|post)\.php(.*?)\[/url\]}i,
     ) do
+      params = $3
       val = ""
-      /[?&]p=(\d+)/i.match($3) { val = "[post]#{$1}[/post]" }
-      /[?&]t=(\d+)/i.match($3) { val = "[thread]#{$1}[/thread]" }
+      /[?&]p(ostid)?=(\d+)/i.match(params) { val = "[post]#{$2}[/post]" }
+      /[?&]t(hreadid)?=(\d+)/i.match(params) { val = "[thread]#{$2}[/thread]" }
       val
     end
     raw.gsub!(
       %r{\[url="?(https?:)?//#{Regexp.escape(FORUM_URL)}show(thread|post)\.php(.*?)"?\](.*?)\[/url\]}im,
     ) do
+      params = $3
       text = $4
       val = $4
-      /[?&]p=(\d+)/i.match($3) { val = "[post=#{$1}]#{text}[/post]" }
-      /[?&]t=(\d+)/i.match($3) { val = "[thread=#{$1}]#{text}[/thread]" }
+      /[?&]p(ostid)?=(\d+)/i.match(params) { val = "[post=#{$2}]#{text}[/post]" }
+      /[?&]t(hreadid)?=(\d+)/i.match(params) { val = "[thread=#{$2}]#{text}[/thread]" }
       val
     end
 
     # [URL=...]...[/URL]
     raw.gsub!(%r{\[url="?([^"]+?)"?\](.*?)\[/url\]}im) { "[#{$2.strip}](#{$1})" }
-    raw.gsub!(%r{\[url="?(.+?)"?\](.+)\[/url\]}im) { "[#{$2.strip}](#{$1})" }
+    raw.gsub!(%r{\[url="?(.+?)"?\](.*?)\[/url\]}im) { "[#{$2.strip}](#{$1})" }
 
     # [URL]...[/URL]
     # [MP3]...[/MP3]
@@ -1277,7 +1358,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw.gsub!(%r{\[/?small\]}i, "")
     raw.gsub!(%r{\[/?h(=.*?)?\]}i, "")
     raw.gsub!(%r{\[/?float(=.*?)?\]}i, "")
-    raw.gsub!(%r{\[(/?)highlight\]}i, '[\1b]')
+
+    # [highlight]...[/highlight]
+    raw.gsub!(%r{\[highlight\](.*?)\[/highlight\]}i, '<mark>\1</mark>')
 
     # [CENTER]...[/CENTER]
     raw.gsub!(%r{\[/?center\]}i, "")
@@ -1314,9 +1397,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw.gsub!(/^\+/, '\+')
 
     # Basic list conversion
-    # TODO: maybe support numeric?
-    raw.gsub!(%r{\[list(=1)?\](.*?)\[/list\]}im) { " \n#{$1} \n" }
-    raw.gsub!(/\[\*\]\s*(.*?)\n/) { "* #{$1}\n" }
+    #raw.gsub!(%r{\[list(=.*?)?\](.*?)\[/list\]}im) { "\n#{$1}\n" }
+    #raw.gsub!(/\[\*\]\s*(.*?)\n/) { "* #{$1}\n" }
+    raw = bbcode_list_to_md(raw)
 
     # [hr]...[/hr]
     raw.gsub! %r{\[hr\](.*?)\[/hr\]}im, "\n\n---\n\n"
@@ -1356,7 +1439,55 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw
   end
 
-  def postprocess_post_raw(raw)
+  def bbcode_list_to_md(input)
+    head, match, input = input.partition(/\[list(=.*?)?\]/i)
+    return head unless match
+    result = head
+    input.lstrip!
+    type = []
+    if /\[list=.*?\]/.match(match)
+      type << "1. "
+    else
+      type << "* "
+    end
+    until input.empty?
+      head, match, input = input.partition(%r{\[(/?list(=.*?)?|\*)\]}i)
+      result << head
+      if match == ""
+        break
+      elsif match == "[*]"
+        input.lstrip!
+        result << "\n" unless result[-1] == "\n" || result.length == 0
+        if type.length == 0
+          # List-less list
+          result << "* "
+        else
+          result << ("    " * (type.length - 1))
+          result << type.last
+        end
+      elsif match.downcase == "[/list]"
+        type.pop
+        if type.length > 0
+          input.lstrip!
+        else
+          result << "\n" unless result[-1] == "\n"
+        end
+      else
+        if type.length == 0
+          result << "\n" unless result[-1] == "\n" || result.length == 0
+        end
+        input.lstrip!
+        if /\[list=.*?\]/i.match(match)
+          type << "1. "
+        else
+          type << "* "
+        end
+      end
+    end
+    result
+  end
+
+  def postprocess_post_raw(post, raw)
     # [QUOTE=<username>;<post_id>]
     raw.gsub!(/\[quote=([^;]+);(\d+)\]/im) do
       old_username, post_id = $1, $2
