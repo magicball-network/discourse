@@ -32,6 +32,10 @@ class ImportScripts::VBulletin < ImportScripts::Base
   IMAGES_DIR ||= ENV["IMAGES_DIR"] || "/path/to/your/images/folder"
   FORUM_URL ||= ENV["FORUM_URL"] || "localhost/"
 
+  FORUM_GENERAL_ID ||= ENV["FORUM_GENERAL_ID"].to_i || -1
+  FORUM_FEEDBACK_ID ||= ENV["FORUM_FEEDBACK_ID"].to_i || -1
+  FORUM_STAFF_ID ||= ENV["FORUM_STAFF_ID"].to_i || -1
+
   puts "#{DB_USER}:#{DB_PW}@#{DB_HOST} wants #{DB_NAME}"
 
   def initialize
@@ -104,18 +108,22 @@ EOM
 
     import_groups
     # Do not enable while creating users, affects performance
-    SiteSetting.migratepassword_enabled = false
+    SiteSetting.migratepassword_enabled = false if SiteSetting.has_setting?(
+      "migratepassword_enabled",
+    )
     import_users
-    SiteSetting.migratepassword_enabled = true
+    SiteSetting.migratepassword_enabled = true if SiteSetting.has_setting?(
+      "migratepassword_enabled",
+    )
     create_groups_membership
     setup_group_membership_requests
 
+    setup_default_categories
     import_categories
     setup_category_moderator_groups
 
     import_topics
     import_posts
-    #import_private_messages
     import_pm_archive
     import_attachments
 
@@ -170,7 +178,7 @@ EOM
   end
 
   def setup_group_membership_requests
-    puts "", "Setting group membership requests..."
+    puts "", "setting group membership requests..."
     groups = mysql_query <<-SQL
       SELECT distinct usergroupid
         FROM usergroupleader
@@ -191,7 +199,7 @@ EOM
   end
 
   def import_users
-    puts "", "importing users"
+    puts "", "importing users..."
 
     leaders = mysql_query <<-SQL
       SELECT usergroupid, userid
@@ -320,7 +328,7 @@ EOM
   end
 
   def create_groups_membership
-    puts "", "Creating groups membership..."
+    puts "", "creating groups membership..."
 
     Group.find_each do |group|
       begin
@@ -436,6 +444,20 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     end
   end
 
+  def setup_default_categories
+    set_category_importid(SiteSetting.general_category_id, FORUM_GENERAL_ID)
+    set_category_importid(SiteSetting.meta_category_id, FORUM_FEEDBACK_ID)
+    set_category_importid(SiteSetting.staff_category_id, FORUM_STAFF_ID)
+  end
+
+  def set_category_importid(category_id, import_id)
+    return if category_id == -1 || !import_id || import_id <= 0
+    cat = Category.find_by_id(category_id)
+    cat.custom_fields["import_id"] = import_id
+    cat.save!
+    add_category(import_id, cat)
+  end
+
   def import_categories
     puts "", "importing top level categories..."
 
@@ -478,7 +500,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       end
     end
 
-    puts "", "Applying category permissions..."
+    puts "", "applying category permissions..."
     top_level_categories.each { |c| process_category_permissions(c, categories) }
   end
 
@@ -652,7 +674,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def setup_category_moderator_groups
-    puts "", "creating category moderator groups"
+    puts "", "creating category moderator groups..."
     forums = mysql_query("SELECT forumid, parentid, title FROM #{TABLE_PREFIX}forum").to_a
     forums.each { |f| f["children"] = forums.select { |c| c["parentid"] == f["forumid"] } }
     forum_map = forums.map { |f| [f["forumid"], f] }.to_h
@@ -753,14 +775,14 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
             preprocess_post_raw(topic["raw"])
           rescue StandardError => e
             puts "",
-                 "Failed preprocessing raw for thread #{topic["threadid"]}",
+                 "\tFailed preprocessing raw for thread #{topic["threadid"]}",
                  e.message,
                  e.backtrace
             nil
           end
 
         if raw.blank?
-          puts "", "No body for thread #{topic["threadid"]}"
+          puts "", "\tNo body for thread #{topic["threadid"]}"
           next
         end
 
@@ -802,7 +824,11 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     # Ensure unique values
     options.each_index do |x|
       cnt = 1
-      val = options[x].strip
+      val = preprocess_post_raw(options[x])
+      val.strip!
+      # escape some markdown which probably shouldn't be there
+      val.gsub!(/^([*#>_-])/) { "\\#{$1}" }
+      val = "." if val == ""
       idx = options.find_index(val)
       while !idx.nil? && idx < x
         cnt += 1
@@ -882,7 +908,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           begin
             preprocess_post_raw(post["raw"])
           rescue StandardError => e
-            puts "", "Failed preprocessing raw for post #{post["postid"]}", e.message, e.backtrace
+            puts "", "\tFailed preprocessing raw for post #{post["postid"]}", e.message, e.backtrace
             nil
           end
 
@@ -891,13 +917,13 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
             # Post with no text, but does have attachments
             raw = "[attach]0[/attach]"
           else
-            puts "", "No body for post #{post["postid"]}"
+            puts "", "\tNo body for post #{post["postid"]}"
             next
           end
         end
 
         unless topic = topic_lookup_from_imported_post_id("thread-#{post["threadid"]}")
-          puts "", "Missing thread for post #{post["postid"]}: thread-#{post["threadid"]}"
+          puts "", "\tMissing thread for post #{post["postid"]}: thread-#{post["threadid"]}"
           next
         end
 
@@ -932,7 +958,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
     unless row = results.first
       puts "",
-           "Couldn't find attachment record #{attachment_id} for post.id = #{post.id}, import_id = #{post.custom_fields["import_id"]}"
+           "\tCouldn't find attachment record #{attachment_id} for post.id = #{post.id}, import_id = #{post.custom_fields["import_id"]}"
       return nil, nil
     end
 
@@ -944,7 +970,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     unless File.exist?(filename)
       if row["dbsize"].to_i == 0
         puts "",
-             "Attachment file #{row["attachment_id"]} doesn't exist. Filename: #{real_filename}. Path: #{filename}"
+             "\tAttachment file #{row["attachment_id"]} doesn't exist. Filename: #{real_filename}. Path: #{filename}"
         return nil, real_filename
       end
 
@@ -956,7 +982,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     upload = create_upload(post.user.id, filename, real_filename)
 
     if upload.nil? || !upload.valid?
-      puts "", "Upload not valid :( Attachment #{attachment_id}"
+      puts "", "\tUpload not valid :( Attachment #{attachment_id}"
       puts upload.errors.inspect if upload
       return nil, real_filename
     end
@@ -968,137 +994,135 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     puts sql
   end
 
-  def import_private_messages
-    puts "", "importing private messages..."
+  def import_pm_archive
+    puts "", "importing private message archives..."
+    pm_count = mysql_query("SELECT COUNT(pmid) count FROM #{TABLE_PREFIX}pm").first["count"]
+    current_count = 0
+    start = Time.now
 
-    topic_count =
-      mysql_query("SELECT COUNT(pmtextid) count FROM #{TABLE_PREFIX}pmtext").first["count"]
+    users = mysql_query("SELECT distinct userid FROM #{TABLE_PREFIX}pm").to_a
+    users.each do |row|
+      userid = row["userid"]
+      real_userid = user_id_from_imported_user_id(userid)
 
-    last_private_message_id = -1
-
-    batches(BATCH_SIZE) do |offset|
-      private_messages = mysql_query(<<-SQL).to_a
-          SELECT t.pmtextid, t.fromuserid, t.title, t.message, t.touserarray, t.dateline, group_concat(pm.userid separator ',') AS recipients
-            FROM #{TABLE_PREFIX}pmtext t
-       LEFT JOIN #{TABLE_PREFIX}pm ON pm.pmtextid = pmtext.pmtextid AND pm.userid <> t.fromuserid
-           WHERE t.pmtextid > #{last_private_message_id}
-        GROUP BY t.pmtextid, t.fromuserid, t.title, t.message, t.touserarray, t.dateline
-        ORDER BY t.pmtextid
-           LIMIT #{BATCH_SIZE}
-      SQL
-
-      break if private_messages.empty?
-
-      last_private_message_id = private_messages[-1]["pmtextid"]
-      private_messages.reject! { |pm| @lookup.post_already_imported?("pm-#{pm["pmtextid"]}") }
-
-      title_username_of_pm_first_post = {}
-
-      create_posts(private_messages, total: topic_count, offset: offset) do |m|
-        skip = false
-        mapped = {}
-
-        mapped[:id] = "pm-#{m["pmtextid"]}"
-        mapped[:user_id] = user_id_from_imported_user_id(m["fromuserid"]) ||
-          Discourse::SYSTEM_USER_ID
-        mapped[:raw] = begin
-          preprocess_post_raw(m["message"])
-        rescue StandardError
-          nil
-        end
-        mapped[:created_at] = Time.zone.at(m["dateline"])
-        title = @htmlentities.decode(m["title"]).strip[0...255]
-        topic_id = nil
-
-        next if mapped[:raw].blank?
-
-        # users who are part of this private message.
-        target_usernames = []
-        target_userids = []
-        begin
-          to_user_array = PHP.unserialize(m["touserarray"])
-        rescue StandardError
-          puts "#{m["pmtextid"]} -- #{m["touserarray"]}"
-          skip = true
-        end
-
-        begin
-          to_user_array.each do |to_user|
-            if to_user[0] == "cc" || to_user[0] == "bcc" # not sure if we should include bcc users
-              to_user[1].each do |to_user_cc|
-                user_id = user_id_from_imported_user_id(to_user_cc[0])
-                username = User.find_by(id: user_id).try(:username)
-                target_userids << user_id || Discourse::SYSTEM_USER_ID
-                target_usernames << username if username
-              end
-            else
-              user_id = user_id_from_imported_user_id(to_user[0])
-              username = User.find_by(id: user_id).try(:username)
-              target_userids << user_id || Discourse::SYSTEM_USER_ID
-              target_usernames << username if username
-            end
-          end
-        rescue StandardError
-          if m["recipients"]
-            m["recipients"]
-              .split(",")
-              .each do |user_id|
-                username = User.find_by(id: user_id).try(:username)
-                target_userids << user_id || Discourse::SYSTEM_USER_ID
-                target_usernames << username if username
-              end
-          end
-          puts "skipping pm-#{m["pmtextid"]} `to_user_array` is not properly serialized -- #{to_user_array.inspect}"
-          skip = true
-        end
-
-        participants = target_userids
-        participants << mapped[:user_id]
-        begin
-          participants.sort!
-        rescue StandardError
-          puts "one of the participant's id is nil -- #{participants.inspect}"
-        end
-
-        if title =~ /^Re:/
-          parent_id =
-            title_username_of_pm_first_post[[title[3..-1], participants]] ||
-              title_username_of_pm_first_post[[title[4..-1], participants]] ||
-              title_username_of_pm_first_post[[title[5..-1], participants]] ||
-              title_username_of_pm_first_post[[title[6..-1], participants]] ||
-              title_username_of_pm_first_post[[title[7..-1], participants]] ||
-              title_username_of_pm_first_post[[title[8..-1], participants]]
-
-          if parent_id
-            if t = topic_lookup_from_imported_post_id("pm-#{parent_id}")
-              topic_id = t[:topic_id]
-            end
-          end
-        else
-          title_username_of_pm_first_post[[title, participants]] ||= m["pmtextid"]
-        end
-
-        if topic_id
-          mapped[:topic_id] = topic_id
-        else
-          mapped[:title] = title
-          mapped[:archetype] = Archetype.private_message
-          mapped[:target_usernames] = target_usernames.join(",")
-
-          if mapped[:target_usernames].size < 1 # pm with yourself?
-            # skip = true
-            mapped[:target_usernames] = "system"
-            puts "pm-#{m["pmtextid"]} has no target (#{m["touserarray"]})"
-          end
-        end
-
-        skip ? nil : mapped
+      if @lookup.post_already_imported?("pmarchive-#{userid}X") || real_userid.nil?
+        usrcnt =
+          mysql_query(
+            "SELECT COUNT(pmid) count FROM #{TABLE_PREFIX}pm WHERE userid = #{userid}",
+          ).first[
+            "count"
+          ]
+        current_count += usrcnt
+        print_status current_count, pm_count, start
+        next
       end
+
+      filename = "pm-archive-#{userid}.txt"
+      filepath = File.join("/tmp/", "pm-archive-#{userid}.txt")
+
+      File.open(filepath, "wb") do |f|
+        user_pm = mysql_query(<<-SQL)
+          SELECT p.pmid, p.parentpmid, t.fromuserid, t.fromusername, t.title, t.message, t.dateline, t.touserarray
+            FROM #{TABLE_PREFIX}pm p
+            JOIN #{TABLE_PREFIX}pmtext t on t.pmtextid = p.pmtextid
+           WHERE p.userid = #{userid}
+           ORDER BY t.dateline
+        SQL
+
+        user_pm.each do |pm|
+          current_count += 1
+          print_status current_count, pm_count, start
+
+          f << "---\n"
+          f << "id: #{pm["pmid"]}\n"
+          f << "in_reply_to: #{pm["parentpmid"]}\n" if pm["parentpmid"] > 0
+          ts = parse_timestamp(pm["dateline"]).iso8601
+          f << "timestamp: #{ts}\n"
+          title =
+            @htmlentities.decode(
+              pm["title"].encode("UTF-8", invalid: :replace, undef: :replace, replace: ""),
+            )
+          f << "title: #{title}\n"
+          f << "from: #{pm["fromusername"]}\n"
+          to_usernames, to_userids = get_pm_recipients(pm)
+          if to_usernames.length() == 0
+            f << "to: \n"
+          elsif to_usernames.length() == 1
+            f << "to: #{to_usernames[0]}\n"
+          else
+            lst = "  - " + to_usernames.join("\n  -")
+            f << "to:\n#{lst}\n"
+          end
+          f << "message: |+\n  "
+          raw = pm["message"]
+          raw =
+            @htmlentities.decode(
+              raw.encode("UTF-8", invalid: :replace, undef: :replace, replace: ""),
+            ).gsub(/[^[[:print:]]\t\n]/, "")
+          raw = raw.gsub(/(\r)?\n/, "\n  ")
+          f << raw
+          f << "\n\n"
+        end
+      end
+
+      upload = create_upload(real_userid, filepath, filename)
+      File.delete(filepath)
+
+      raw = <<~EOL
+        Attached is your private message archive from the previous forum software.
+        The text file contains all the private messages you had saved at the moment of migration.
+        The file should also be a valid YAML file containing a single document per message.
+
+        EOL
+      raw += html_for_upload(upload, filename)
+
+      newpost = {
+        archetype: Archetype.private_message,
+        user_id: Discourse::SYSTEM_USER_ID,
+        target_usernames: User.find_by(id: real_userid).try(:username),
+        title: "Your private message archive from the previous forum software.",
+        raw: raw,
+        closed: true,
+        archived: true,
+        post_create_action:
+          proc do |post|
+            post.topic.closed = true
+            post.topic.save()
+          end,
+      }
+      create_post(newpost, "pmarchive-#{userid}")
     end
   end
 
-  def import_pm_archive
-    puts "", "importing private message archives..."
+  def get_pm_recipients(pm)
+    target_usernames = []
+    target_userids = []
+    begin
+      to_user_array = PHP.unserialize(pm["touserarray"])
+    rescue StandardError
+      return target_usernames, target_userids
+    end
+
+    begin
+      to_user_array.each do |to_user|
+        if to_user[0] == "cc" || to_user[0] == "bcc" # not sure if we should include bcc users
+          to_user[1].each do |to_user_cc|
+            user_id = user_id_from_imported_user_id(to_user_cc[0])
+            username = User.find_by(id: user_id).try(:username)
+            target_userids << user_id || Discourse::SYSTEM_USER_ID
+            target_usernames << username if username
+          end
+        else
+          user_id = user_id_from_imported_user_id(to_user[0])
+          username = User.find_by(id: user_id).try(:username)
+          target_userids << user_id || Discourse::SYSTEM_USER_ID
+          target_usernames << username if username
+        end
+      end
+    rescue StandardError
+      return target_usernames, target_userids
+    end
+    [target_usernames, target_userids]
   end
 
   def import_attachments
@@ -1118,7 +1142,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       post_id = post_id_from_imported_post_id(attachment["postid"])
       post_id = post_id_from_imported_post_id("thread-#{attachment["threadid"]}") unless post_id
       if post_id.nil?
-        puts "Post for attachment #{attachment["attachmentid"]} not found"
+        puts "\tPost for attachment #{attachment["attachmentid"]} not found"
         next
       end
       mapping[post_id] ||= []
@@ -1208,7 +1232,6 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       end
 
       if new_raw != post.raw
-        puts "", post.custom_fields, new_raw, post.raw if new_raw.length < 1
         post.raw = new_raw
         post.save
       end
@@ -1218,7 +1241,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def close_topics
-    puts "", "Closing topics..."
+    puts "", "closing topics..."
 
     # keep track of closed topics
     closed_topic_ids = []
@@ -1252,7 +1275,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def post_process_posts
-    puts "", "Postprocessing posts..."
+    puts "", "postprocessing posts..."
 
     current = 0
     max = Post.count
@@ -1277,14 +1300,13 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   def preprocess_post_raw(raw)
     return "" if raw.blank?
 
-    raw = raw.encode("UTF-8", "UTF-8", invalid: :replace)
+    raw = raw.encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
 
     # decode HTML entities
     raw = @htmlentities.decode(raw)
 
     # fix whitespaces
-    raw.gsub!(/(\\r)?\\n/, "\n")
-    #raw.gsub!("\\t", "\t")
+    raw.gsub!(/(\r)?\n/, "\n")
 
     # [HTML]...[/HTML]
     raw.gsub!(/\[html\]/i, "\n```html\n")
@@ -1569,34 +1591,6 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     raw
   end
 
-  def create_permalink_file
-    puts "", "Creating Permalink File...", ""
-
-    Topic.listable_topics.find_each do |topic|
-      pcf = topic.first_post.custom_fields
-      if pcf && pcf["import_id"]
-        id = pcf["import_id"].split("-").last
-        begin
-          Permalink.create(url: "/showthread.php?t=#{id}", topic_id: topic.id)
-        rescue StandardError
-          nil
-        end
-      end
-    end
-
-    Category.find_each do |cat|
-      ccf = cat.custom_fields
-      if ccf && ccf["import_id"]
-        id = ccf["import_id"].to_i
-        begin
-          Permalink.create(url: "/forumdisplay.php?f=#{id}", category_id: cat.id)
-        rescue StandardError
-          nil
-        end
-      end
-    end
-  end
-
   def suspend_users
     puts "", "updating banned users"
 
@@ -1623,11 +1617,12 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           )
           banned += 1
         else
-          puts "Failed to suspend user #{user.username}. #{user.errors.try(:full_messages).try(:inspect)}"
+          puts "",
+               "\tFailed to suspend user #{user.username}. #{user.errors.try(:full_messages).try(:inspect)}"
           failed += 1
         end
       else
-        puts "Not found: #{b["userid"]}"
+        puts "", "\tNot found: #{b["userid"]}"
         failed += 1
       end
 
@@ -1636,7 +1631,6 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
   end
 
   def parse_timestamp(timestamp)
-    #Time.zone.at(@tz.utc_to_local(timestamp))
     return if timestamp.nil?
     Time.zone.at(@tz.utc_to_local(TZInfo::Timestamp.new(timestamp)).to_datetime)
   end
