@@ -257,6 +257,7 @@ GEM
       bigdecimal (~> 3.1)
     mustache (1.1.1)
     mutex_m (0.2.0)
+    mysql2 (0.5.6)
     net-http (0.4.1)
       uri
     net-imap (0.4.14)
@@ -324,6 +325,7 @@ GEM
       ast (~> 2.4.1)
       racc
     pg (1.5.4)
+    php_serialize (1.2)
     prettier_print (1.2.1)
     progress (3.6.0)
     pry (0.14.2)
@@ -661,6 +663,7 @@ DEPENDENCIES
   multi_json
   mustache
   mutex_m
+  mysql2
   net-http
   net-imap
   net-pop
@@ -675,6 +678,7 @@ DEPENDENCIES
   omniauth-twitter
   parallel_tests
   pg
+  php_serialize
   pry-byebug
   pry-rails
   pry-stack_explorer

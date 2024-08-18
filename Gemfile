@@ -276,3 +276,7 @@ gem "drb"
 # dependencies for the automation plugin
 gem "iso8601"
 gem "rrule"
+
+# For vBulletin import script
+gem 'mysql2', require: false
+gem 'php_serialize', require: false
