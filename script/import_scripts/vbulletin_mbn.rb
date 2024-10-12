@@ -1177,7 +1177,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           next "\n:x: ERROR: missing attachment #{filename}\n"
         end
 
-        html_for_upload(upload, filename)
+        html = html_for_upload(upload, filename)
+        UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
+        html
       end
 
       new_raw.gsub!(attachment_regex2) do |s|
@@ -1193,7 +1195,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           next "\n:x: ERROR: missing attachment #{filename}\n"
         end
 
-        html_for_upload(upload, filename)
+        html = html_for_upload(upload, filename)
+        UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
+        html
       end
 
       # make resumed imports faster
@@ -1227,6 +1231,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
 
           # internal upload deduplication will make sure that we do not import attachments again
           html = html_for_upload(upload, filename)
+          UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
           new_raw += "\n\n#{html}\n\n" if !new_raw[html]
         end
       end
