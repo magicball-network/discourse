@@ -122,15 +122,15 @@ EOM
     import_categories
     setup_category_moderator_groups
 
-    import_topics
-    import_posts
-    import_pm_archive
-    import_attachments
+    #import_topics
+    #import_posts
+    #import_pm_archive
+    #import_attachments
 
-    close_topics
-    post_process_posts
+    #close_topics
+    #post_process_posts
 
-    suspend_users
+    #suspend_users
   end
 
   def import_settings
@@ -545,16 +545,20 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       category.subcategory_list_style = "rows_with_featured_topics"
     end
 
+    if forum["is_category_only"] == 1
+      # Mimmic vbulletin behavior to not show any posts
+      category.default_list_filter = "none"
+    end
+    if !category.subcategories.empty? && forum["is_category_only"] == 0
+      # Also a forum, don't show content of subforum
+      category.default_list_filter = "none"
+    end
+
     if (forum["is_category_only"] == 1 && access[:public_access] == 1)
       puts "\t#{category.name} is a public category only"
       category.permissions = { everyone: :readonly }
       category.save()
       return
-    end
-
-    if !category.subcategories.empty? && forum["is_category_only"] == 0
-      # Also a forum, don't show content of subforum
-      category.default_list_filter = "none"
     end
 
     permissions = {}
@@ -586,10 +590,13 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     parent_public = true
     parent_parent_public = true
     if !category.parent_category.nil?
-      parent_public = category.parent_category.category_groups.any? { |g| g.group.id == 0 }
+      parent_public =
+        category.parent_category.category_groups.any? { |g| g.group.id == 0 } ||
+          category.parent_category.category_groups.empty?
       if !category.parent_category.parent_category.nil?
         parent_parent_public =
-          category.parent_category.parent_category.category_groups.any? { |g| g.group.id == 0 }
+          category.parent_category.parent_category.category_groups.any? { |g| g.group.id == 0 } ||
+            category.parent_category.parent_category.category_groups.empty?
       end
     end
     apply_defaults = permissions.empty?
@@ -631,10 +638,10 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         permissions[groupid] = :readonly
       end
       # If parents are not public the group must also have readonly access to parent
-      if !parent_parent_public
-        add_minimal_access_to_category(category.parent_category.parent_category, groupid)
-      end
-      add_minimal_access_to_category(category.parent_category, groupid) if !parent_public
+      #if !parent_parent_public
+      #  add_minimal_access_to_category(category.parent_category.parent_category, groupid)
+      #end
+      #add_minimal_access_to_category(category.parent_category, groupid) if !parent_public
     end
   end
 
