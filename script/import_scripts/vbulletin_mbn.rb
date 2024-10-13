@@ -122,15 +122,15 @@ EOM
     import_categories
     setup_category_moderator_groups
 
-    #import_topics
-    #import_posts
-    #import_pm_archive
-    #import_attachments
+    import_topics
+    import_posts
+    import_pm_archive
+    import_attachments
 
-    #close_topics
-    #post_process_posts
+    close_topics
+    post_process_posts
 
-    #suspend_users
+    suspend_users
   end
 
   def import_settings
@@ -806,8 +806,12 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           created_at: parse_timestamp(topic["dateline"]),
           visible: topic["visible"].to_i == 1,
           views: topic["views"],
+          custom_fields: {
+            import_post_id: topic["postid"],
+          },
           post_create_action:
             proc do |post|
+              add_post(topic["postid"].to_s, post)
               post_process_poll(post, poll_data) if poll_data
               Permalink.create(
                 url: "showthread.php?t=#{topic["threadid"]}",
@@ -1012,7 +1016,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
       userid = row["userid"]
       real_userid = user_id_from_imported_user_id(userid)
 
-      if @lookup.post_already_imported?("pmarchive-#{userid}X") || real_userid.nil?
+      if @lookup.post_already_imported?("pmarchive-#{userid}") || real_userid.nil?
         usrcnt =
           mysql_query(
             "SELECT COUNT(pmid) count FROM #{TABLE_PREFIX}pm WHERE userid = #{userid}",
@@ -1093,6 +1097,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         archived: true,
         post_create_action:
           proc do |post|
+            UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
             post.topic.closed = true
             post.topic.save()
           end,
@@ -1169,6 +1174,7 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
     Post.find_each do |post|
       current_count += 1
       print_status current_count, total_count, start
+      upload_ids = []
 
       new_raw = post.raw.dup
       new_raw.gsub!(attachment_regex) do |s|
@@ -1184,9 +1190,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           next "\n:x: ERROR: missing attachment #{filename}\n"
         end
 
-        html = html_for_upload(upload, filename)
-        UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
-        html
+        upload_ids << upload.id
+        html_for_upload(upload, filename)
       end
 
       new_raw.gsub!(attachment_regex2) do |s|
@@ -1202,9 +1207,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
           next "\n:x: ERROR: missing attachment #{filename}\n"
         end
 
-        html = html_for_upload(upload, filename)
-        UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
-        html
+        upload_ids << upload.id
+        html_for_upload(upload, filename)
       end
 
       # make resumed imports faster
@@ -1236,9 +1240,9 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
             next
           end
 
+          upload_ids << upload.id
           # internal upload deduplication will make sure that we do not import attachments again
           html = html_for_upload(upload, filename)
-          UploadReference.ensure_exist!(upload_ids: [upload.id], target: post)
           new_raw += "\n\n#{html}\n\n" if !new_raw[html]
         end
       end
@@ -1247,6 +1251,8 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         post.raw = new_raw
         post.save
       end
+
+      UploadReference.ensure_exist!(upload_ids: upload_ids, target: post)
 
       success_count += 1
     end
