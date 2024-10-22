@@ -638,10 +638,10 @@ LEFT OUTER JOIN #{TABLE_PREFIX}avatar a ON a.avatarid = u.avatarid
         permissions[groupid] = :readonly
       end
       # If parents are not public the group must also have readonly access to parent
-      #if !parent_parent_public
-      #  add_minimal_access_to_category(category.parent_category.parent_category, groupid)
-      #end
-      #add_minimal_access_to_category(category.parent_category, groupid) if !parent_public
+      if !parent_parent_public
+        add_minimal_access_to_category(category.parent_category.parent_category, groupid)
+      end
+      add_minimal_access_to_category(category.parent_category, groupid) if !parent_public
     end
   end
 
