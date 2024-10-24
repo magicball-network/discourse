@@ -36,6 +36,8 @@ class ImportScripts::VBulletin < ImportScripts::Base
   FORUM_FEEDBACK_ID ||= ENV["FORUM_FEEDBACK_ID"].to_i || -1
   FORUM_STAFF_ID ||= ENV["FORUM_STAFF_ID"].to_i || -1
 
+  CREATE_USERTITLE_FIELD ||= ENV["CREATE_USERTITLE_FIELD"].to_i != 0 || false
+
   puts "#{DB_USER}:#{DB_PW}@#{DB_HOST} wants #{DB_NAME}"
 
   def initialize
@@ -69,8 +71,13 @@ export DB_NAME="vbulletin"
 export DB_PW=""
 export DB_USER="root"
 export TABLE_PREFIX="vb_"
-export ATTACHMENT_DIR '/path/to/your/attachment/folder'
-export IMAGES_DIR '/path/to/your/images/folder'
+export ATTACHMENT_DIR='/path/to/your/attachment/folder'
+export IMAGES_DIR='/path/to/your/images/folder'
+
+export FORUM_GENERAL_ID=-1
+export FORUM_FEEDBACK_ID=-1
+export FORUM_STAFF_ID=-1
+export CREATE_USERTITLE_FIELD=0
 
 Exiting.
 EOM
@@ -221,6 +228,23 @@ EOM
 
     last_user_id = -1
 
+    if CREATE_USERTITLE_FIELD
+      userTitleField = UserField.find_by(name: "User title")
+      if userTitleField.nil?
+        userTitleField =
+          UserField.new(
+            name: "User title",
+            description: "One line description about you.",
+            editable: true,
+            show_on_profile: true,
+            requirement: "optional",
+            field_type_enum: "text",
+          )
+        userTitleField.save!
+        puts "created 'user title' user field"
+      end
+    end
+
     batches(BATCH_SIZE) do |offset|
       users = mysql_query(<<-SQL).to_a
           SELECT userid
@@ -274,7 +298,6 @@ EOM
           email: email,
           merge: true,
           website: user["homepage"].strip,
-          title: @htmlentities.decode(user["usertitle"]).strip,
           primary_group_id: group_id_from_imported_group_id(user["usergroupid"].to_i),
           created_at: parse_timestamp(user["joindate"]),
           last_seen_at: parse_timestamp(user["lastvisit"]),
@@ -285,6 +308,9 @@ EOM
             proc do |u|
               import_profile_picture(user, u)
               import_profile_background(user, u)
+              if CREATE_USERTITLE_FIELD
+                u.set_user_field(userTitleField.id, @htmlentities.decode(user["usertitle"]).strip)
+              end
               u.grant_admin! if user["usergroupid"] == 6
               u.grant_moderation! if user["usergroupid"] == 5
               GroupUser.transaction do
