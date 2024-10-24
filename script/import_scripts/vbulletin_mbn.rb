@@ -269,7 +269,6 @@ EOM
 
         {
           id: user["userid"],
-          name: username,
           username: username,
           password: password,
           email: email,
